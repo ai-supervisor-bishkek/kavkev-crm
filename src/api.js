@@ -1,0 +1,3783 @@
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+const db = require('./db');
+const auth = require('./auth');
+const { parseMultipart } = require('./multipart');
+const { buildZip } = require('./miniZip');
+const { parseTableFile } = require('./fileTable');
+const { looksLikeConsignmentLedger, parseConsignmentLedger } = require('./debtLedger');
+const googleSheets = require('./googleSheets');
+const { normalizePhone, MONTH_ORDER } = require('./import');
+const whatsapp = require('./whatsapp');
+const abc = require('./abc');
+const activity = require('./activity');
+const stockImport = require('../scripts/import_stock_days');
+const geoTrack = require('./geoTrack');
+const IMPORT_DIR = path.join(__dirname, '..', 'data', 'import');
+
+// ---- Правка 01.09.2026: "протухание" данных за текущий месяц ----
+// currentMonthRevenue/currentMonthItems (продажи "текущего месяца") и promotions
+// (акции) на клиенте считаются из ПОСЛЕДНЕГО присланного реестра. Раньше эти
+// показатели продолжали показывать цифры прошлого месяца даже после того, как
+// реальный календарь ушёл дальше — что выглядело как "продажи за этот месяц",
+// хотя по факту это уже прошлый месяц без новых данных. Пользователь явно
+// попросил: пока не пришлют новый реестр за новый месяц, все такие показатели
+// должны быть 0, а не "зависать" на цифрах прошлого месяца.
+// ВАЖНО: это НЕ относится к остаткам склада и задолженности — они снимок на
+// дату (не "поток за месяц") и по решению пользователя продолжают показывать
+// последнее известное значение, но с явной пометкой "на такое-то число"
+// (см. STOCK_AS_OF ниже и client.debtAsOf, уже существовавшее поле).
+//
+// Фаза 22 (08.09.2026): загружен срез продаж за 01.09–07.09.26 (частичная
+// неделя, не полный месяц — пользователь явно выбрал загрузить как срез, а не
+// ждать закрытия сентября) — `data/import/current_month_sales.json` заменён
+// содержимым за сентябрь (было — август), `CURRENT_MONTH_DATA_STALE_FROM`
+// передвинут на 1-е октября. Как и всегда с этим показателем — это именно
+// "продано в текущем месяце НА СЕГОДНЯ", растущий по ходу месяца снимок, а не
+// прогноз на весь месяц; когда придёт более полная выгрузка за сентябрь —
+// заменить файл ещё раз тем же способом, дату протухания не трогать (она уже
+// верна до конца сентября).
+//
+// Обновить при добавлении нового реестра продаж (например, за октябрь):
+// 1) добавить новый месяц в MONTH_ORDER (src/import.js) и во все MONTHS-списки
+//    python-пайплайна (см. Технические заметки в статус-документе проекта) —
+//    ТОЛЬКО когда сентябрь закроется целиком и станет частью 7-месячного окна
+//    регулярного ассортимента, не раньше;
+// 2) передвинуть CURRENT_MONTH_DATA_STALE_FROM на 1-е число месяца, СЛЕДУЮЩЕГО
+//    за новым последним месяцем (сейчас: сентябрь 2026 → '2026-10-01', уже сделано).
+// 01.10.2026: текущий месяц — октябрь (сентябрь закрыт и ушёл в историю).
+const CURRENT_MONTH_DATA_STALE_FROM = new Date('2026-11-01T00:00:00');
+function isCurrentMonthDataFresh() {
+  return new Date() < CURRENT_MONTH_DATA_STALE_FROM;
+}
+// Факт продаж текущего месяца ПО АГЕНТУ (Фаза 39) — «Итого» из последнего
+// среза агента (data/import/agent_sales.json → настройка agentSales, её пишет
+// runImport()). Не сумма по карточкам! См. src/agentSales.js.
+function agentSalesFact(agentName) {
+  const all = db.getSetting('agentSales', {}) || {};
+  const a = all[agentName];
+  if (!a || !isCurrentMonthDataFresh()) return { total: 0, items: [], period: a ? a.period : '', asOf: a ? a.asOf : null };
+  return a;
+}
+// ---- Отметки посещений (Фаза 40) ----
+const VISIT_RADIUS_M = 30;                // «у точки», если ближе (по умолчанию; у клиента можно задать свой visitRadius)
+function effVisitRadius(client) { const r = client && Number(client.visitRadius); return r > 0 ? r : VISIT_RADIUS_M; }
+// Статус отметки с учётом радиуса точки: near/far пересчитываем по сохранённому расстоянию,
+// чтобы смена радиуса сразу отражалась в отчётах (26.10.2026).
+function effVisitStatus(visit, client) { if ((visit.status === 'near' || visit.status === 'far') && visit.distance != null) return visit.distance <= effVisitRadius(client) ? 'near' : 'far'; return visit.status; }
+const VISIT_FIRST_MAX_ACCURACY_M = 200;   // первую отметку с худшей точностью GPS не берём за координаты точки
+const VISIT_REPEAT_MIN = 10;              // повторная отметка того же агента у той же точки — не чаще
+const VISITS_KEEP = 300;
+// Отметки, которые НЕ засчитываются как посещение (не закрывают задачу):
+// без GPS и те, чьи координаты супервайзер сбросил как ошибочные.
+const VISIT_NOT_COUNTED = ['nogps', 'reset'];                  // сколько последних посещений хранить в карточке
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (x) => x * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function bishkekDate(d) {
+  return new Date(d.getTime() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// 26.10.2026: убрать GPS-выбросы из трека. Точка считается выбросом, если она дальше
+// maxJump от предыдущей ОСТАВЛЕННОЙ точки, следующая точка тоже дальше maxJump от неё,
+// а предыдущая и следующая при этом ближе maxJump друг к другу (телефон «прыгнул» и
+// вернулся). Несколько проходов — на случай двух подряд. Исходные данные не меняются.
+// 27.10.2026: разрывы трека («офлайн») — промежутки между точками одного дня дольше
+// TRACK_GAP_MIN минут (ночные промежутки между днями не считаем). Возвращает список
+// {fromT,toT,minutes,fromLat,fromLng,toLat,toLng} и суммарные минуты офлайна в рабочее время.
+const TRACK_GAP_MIN = 10;
+function trackGaps(pts) {
+  const gaps = []; let totalMin = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    if (bishkekDate(new Date(a.t * 1000)) !== bishkekDate(new Date(b.t * 1000))) continue; // разные дни — это ночь
+    const min = Math.round((b.t - a.t) / 60);
+    if (min < TRACK_GAP_MIN) continue;
+    totalMin += min;
+    gaps.push({ fromT: a.t, toT: b.t, minutes: min, fromLat: a.lat, fromLng: a.lng, toLat: b.lat, toLng: b.lng });
+  }
+  return { gaps, totalMin };
+}
+function filterTrackSpikes(pts, maxJump) {
+  if (!pts || pts.length < 3) return pts || [];
+  let cur = pts.slice();
+  for (let pass = 0; pass < 5; pass++) {
+    const out = [cur[0]];
+    let dropped = false;
+    for (let i = 1; i < cur.length - 1; i++) {
+      const prev = out[out.length - 1], p = cur[i], next = cur[i + 1];
+      const dPrev = haversineM(prev.lat, prev.lng, p.lat, p.lng);
+      const dNext = haversineM(p.lat, p.lng, next.lat, next.lng);
+      const dSkip = haversineM(prev.lat, prev.lng, next.lat, next.lng);
+      if (dPrev > maxJump && dNext > maxJump && dSkip < maxJump) { dropped = true; continue; }
+      out.push(p);
+    }
+    out.push(cur[cur.length - 1]);
+    cur = out;
+    if (!dropped) break;
+  }
+  return cur;
+}
+function agentSalesChecks() {
+  if (!isCurrentMonthDataFresh()) return [];
+  const check = db.getSetting('agentSalesCheck', {}) || {};
+  return Object.entries(check).map(([agentName, ch]) => ({ agentName, ...ch }));
+}
+// Возвращает список клиентов с обнулёнными currentMonthRevenue/currentMonthItems/
+// promotions, если данные "текущего месяца" устарели (см. выше) — иначе список
+// без изменений. Применять на КАЖДОМ месте, где список клиентов идёт на
+// отображение (дашборд, отчёты, GET /api/clients) — но не там, где клиент
+// используется для записи/бизнес-логики, не связанной с деньгами (задачи и т.п.).
+// Правка Фазы 18 (02.09.2026): «Недопродано» (флаг atRisk на позициях
+// regularAssortment) больше не считается один раз при импорте — теперь это
+// "постоянный ассортимент минус продажи текущего месяца" (фокус на допродажу),
+// см. computeAtRisk() ниже. Считаем его здесь же, динамически, при КАЖДОЙ
+// отдаче клиента — это единственное место в API, где регулярный ассортимент
+// сверяется с currentMonthItems, так что менять эту логику нужно только тут.
+// Явный плюс: если прислали свежий срез продаж текущего месяца, но полную
+// 6-месячную классификацию ассортимента ещё не пересобирали — "недопродано"
+// всё равно обновится сразу же, на следующий же запрос, без пересборки.
+//
+// currentMonthItems/currentMonthRevenue/promotions по-прежнему обнуляются,
+// пока не пришёл новый реестр за новый месяц (см. isCurrentMonthDataFresh()
+// выше) — сам список regularAssortment/testAssortment НЕ обнуляется и не
+// укорачивается (историческая статистика, актуальна независимо от календаря).
+// Когда currentMonthItems пуст (неважно, из-за протухания или потому что по
+// текущему месяцу правда ещё не было продаж) — atRisk честно становится true
+// у всей постоянки: это и есть "ничего из постоянного ассортимента ещё не
+// продано в этом месяце", ровно то, что нужно для фокуса на допродажу.
+// norm() уже объявлена ниже в этом же файле (используется и для сверки
+// клиентов при импорте) — JS поднимает объявления function наверх области
+// видимости, так что вызывать её здесь, до текстового объявления, безопасно.
+function computeAtRisk(regularAssortment, currentMonthItems) {
+  const boughtThisMonth = new Set((currentMonthItems || []).map((it) => norm(it.product)));
+  return (regularAssortment || []).map((p) => ({ ...p, atRisk: !boughtThisMonth.has(norm(p.product)) }));
+}
+function withFreshCurrentMonth(clients) {
+  const fresh = isCurrentMonthDataFresh();
+  return clients.map((c) => {
+    const currentMonthItems = fresh ? (c.currentMonthItems || []) : [];
+    return {
+      ...c,
+      currentMonthRevenue: fresh ? (c.currentMonthRevenue || 0) : 0,
+      currentMonthItems,
+      currentMonthLastSale: fresh ? (c.currentMonthLastSale || null) : null,
+      // Фаза 24 (09.09.2026): «Акции» по клиентам убраны по просьбе пользователя
+      // («убери акции по клиентам текущие показатели этого месяца») — фронтенду
+      // promotions больше не отдаём (пустой список всегда), независимо от
+      // свежести данных. Импорт (src/import.js) по-прежнему кладёт promotions на
+      // саму запись клиента в базе — это не трогали, просто API их не отдаёт.
+      promotions: [],
+      regularAssortment: computeAtRisk(c.regularAssortment, currentMonthItems)
+    };
+  });
+}
+// Этапы доски задач. "Новая задача" убрана — задача сразу создаётся в "В работе".
+// "Лист ожидания" и "Прогрев" больше не этапы доски, а теги задачи (см. TASK_TAGS) —
+// так их проще сочетать с обычным статусом выполнения.
+// "Архив" — задачу переводит туда только администратор/супервайзер, после того как
+// подтвердит выполненный визит; у агента на доске этого этапа нет (см. GET /api/tasks).
+const TASK_STAGES = [
+  { key: 'in_progress', label: 'В работе' },
+  { key: 'done', label: 'Выполнена' },
+  { key: 'not_done', label: 'Не выполнена' },
+  { key: 'archive', label: 'Архив' }
+];
+
+const STAFF_ONLY_STAGES = ['archive'];
+
+// "Продажа" (taskType: 'sale') — до Фазы 22 была отдельной воронкой со своими
+// этапами (звонок → встреча → сделка/провал), обязательным пояснением перед
+// закрытием и отдельным разделом аудиозаписи встречи. Пользователь явно
+// попросил переделать её в "односложную задачу по клиенту без этапов, просто
+// задача" — с Фазы 22 задача типа 'sale' технически устроена ТОЧНО ТАК ЖЕ, как
+// обычный визит (использует TASK_STAGES/ACTIVE_STAGES, отчёт при закрытии в
+// "Выполнена" обязателен так же, как у визита), различается только своим
+// собственным набором тегов (SALE_TAGS ниже — бренды + "Договор") и заголовком
+// формы/списком в интерфейсе, чтобы сохранить отдельную вкладку для фильтрации.
+// Старые задачи на прежних этапах (call/meeting/deal/fail) мигрируются в новую
+// схему в migrateLegacyTaskStages() (см. ниже) при каждом старте сервера.
+const SALE_TAGS = ['Классика', 'Мясные', 'Премиум', 'Договор'];
+
+// Воронка "Лист ожидания" (клиент ждёт товар, которого сейчас нет в наличии) —
+// отдельный тип задачи (taskType: 'waitlist'). Финальный этап "получена" закрывает
+// задачу и, как и «Архив» у визитов, подтверждается только администратором/супервайзером.
+const WAITLIST_STAGES = [
+  { key: 'waiting', label: 'Клиент ждёт товар' },
+  { key: 'invoiced', label: 'Накладная оформлена' },
+  { key: 'received', label: 'Товар получен клиентом' }
+];
+const WAITLIST_STAFF_ONLY_STAGES = ['received'];
+const WAITLIST_ACTIVE_STAGES = ['waiting', 'invoiced'];
+const WAITLIST_TAGS = ['Классика', 'Мясные', 'Премиум'];
+const VISIT_DAYS = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+// JS: getDay() воскресенье=0, понедельник=1 ... суббота=6
+const VISIT_DAY_INDEX = { 'Понедельник': 1, 'Вторник': 2, 'Среда': 3, 'Четверг': 4, 'Пятница': 5, 'Суббота': 6 };
+
+// Ближайшая дата (после сегодня) с нужным днём недели, в формате YYYY-MM-DD.
+function nextDateForWeekday(weekdayName) {
+  const targetIdx = VISIT_DAY_INDEX[weekdayName];
+  if (targetIdx === undefined) return null;
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  do {
+    d.setDate(d.getDate() + 1);
+  } while (d.getDay() !== targetIdx);
+  return d.toISOString().slice(0, 10);
+}
+
+const TASK_TAGS = ['Классика', 'Мясные', 'Премиум', 'новая точка', 'Возврат', 'Долги'];
+const ACTIVE_STAGES = ['in_progress'];
+// Общий помощник: активна ли задача (не закрыта), независимо от её типа. С Фазы
+// 22 'sale' по этапам устроена так же, как 'visit' (общий ACTIVE_STAGES) — своя
+// ветка осталась только у 'waitlist', у которой этапы по-прежнему другие.
+function isActiveStage(task) {
+  if (task.taskType === 'waitlist') return WAITLIST_ACTIVE_STAGES.includes(task.stage);
+  return ACTIVE_STAGES.includes(task.stage);
+}
+
+// Срок любой задачи — до 20:00 (по Бишкеку) дня, на который она поставлена
+// (Фаза 40, 25.09.2026, прямое указание пользователя: «срок у задачи до 20-00
+// дня, поставленного на неё; касается всех задач»). После 20:00 активная задача
+// этого дня — «просрочена»; раньше просрочкой считался только следующий день.
+const TASK_DEADLINE_HOUR = 20;
+function bishkekNow() { return new Date(Date.now() + 6 * 3600 * 1000); }
+function bishkekToday() { return bishkekNow().toISOString().slice(0, 10); }
+function isTaskOverdue(task) {
+  if (!task.dueDate || !isActiveStage(task)) return false;
+  const today = bishkekToday();
+  if (task.dueDate < today) return true;
+  return task.dueDate === today && bishkekNow().getUTCHours() >= TASK_DEADLINE_HOUR;
+}
+
+// ---- Воронка «Посещения» (Фаза 40) ----
+// Каждый день (в 00:01 по Бишкеку и при старте сервера) на ВСЕХ клиентов базы,
+// у которых день визита = сегодняшний день недели, создаётся задача
+// taskType 'checkin' «Посещение» на агента-владельца. Закрывается отметкой
+// «📍 Отметить посещение» (POST /api/clients/:id/visit). Если отметка за этот
+// день уже есть в карточке клиента (например, после передеплоя), задача сразу
+// создаётся выполненной. Срок — до 20:00 того же дня (см. isTaskOverdue).
+const WEEKDAY_BY_INDEX = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+// Фаза 40, правка 28.09.2026 («неудобно, когда задачи создаются сами — сделай
+// кнопку «создать задачи» и выбор агента»): автосоздание в 00:01 убрано. Задачи
+// создаются кнопкой на вкладке «Посещения» (POST /api/tasks/checkin-generate)
+// на выбранную дату и агента — по клиентам, у кого день визита = день недели
+// этой даты. Уже созданные задачи на ту же дату по тому же клиенту не дублируются.
+function createCheckinTasks(date, agentId, createdBy) {
+  const d = new Date(date + 'T00:00:00Z');
+  const weekday = WEEKDAY_BY_INDEX[d.getUTCDay()];
+  const agentsById = {};
+  db.all('users').forEach((u) => { if (u.role === 'agent' && (!agentId || u.id === agentId)) agentsById[u.id] = u; });
+  const existing = new Set(db.all('tasks').filter((t) => t.taskType === 'checkin' && t.dueDate === date).map((t) => t.clientId));
+  let created = 0;
+  let skipped = 0;
+  db.beginBatch();
+  try {
+    db.all('clients').forEach((c) => {
+      if (c.closed || c.pendingApproval || !agentsById[c.ownerId]) return;
+      if ((c.visitDay || '').trim().toLowerCase() !== weekday.toLowerCase()) return;
+      if (existing.has(c.id)) { skipped++; return; }
+      const visit = (c.visits || []).find((v) => bishkekDate(new Date(v.at)) === date && v.agentId === c.ownerId && !VISIT_NOT_COUNTED.includes(v.status));
+      const nowIso = new Date().toISOString();
+      db.insert('tasks', {
+        clientId: c.id,
+        taskType: 'checkin',
+        title: `Посещение: ${c.name}`,
+        description: '',
+        dueDate: date,
+        visitTime: '',
+        visitTimeTo: '',
+        stage: visit ? 'done' : 'in_progress',
+        tags: [],
+        comment: '',
+        report: visit ? checkinReport(visit) : '',
+        checkinAt: visit ? visit.at : null,
+        dateChangeRequest: null,
+        attachments: [],
+        assigneeId: c.ownerId,
+        createdBy: createdBy || null,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      });
+      created++;
+    });
+  } finally {
+    db.endBatch();
+  }
+  return { created, skipped, weekday };
+}
+// Досинхронизация (на старте и раз в минуту): если отметка появилась в карточке
+// клиента позже создания задачи (например, клиентов загрузили из файла после
+// передеплоя) — закрываем открытую задачу «Посещение» за этот день. Задачи сама
+// больше НЕ создаёт.
+function syncCheckinTasks() {
+  db.beginBatch();
+  try {
+    const clientsById = {};
+    db.all('clients').forEach((c) => { clientsById[c.id] = c; });
+    db.all('tasks').filter((t) => t.taskType === 'checkin' && t.stage === 'in_progress').forEach((t) => {
+      const c = clientsById[t.clientId];
+      const visit = c && (c.visits || []).find((v) => bishkekDate(new Date(v.at)) === t.dueDate && v.agentId === t.assigneeId && !VISIT_NOT_COUNTED.includes(v.status));
+      if (visit) db.update('tasks', t.id, { stage: 'done', report: checkinReport(visit), checkinAt: visit.at, updatedAt: new Date().toISOString() });
+    });
+  } finally {
+    db.endBatch();
+  }
+}
+function checkinReport(visit) {
+  const t = new Date(visit.at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bishkek' });
+  const st = { near: `у точки${visit.distance != null ? `, ${visit.distance} м` : ''}`, first: 'первая отметка — координаты точки сохранены', reset: 'координаты сброшены — не засчитано', far: `далеко от точки, ${visit.distance} м`, nogps: 'без GPS', lowacc: 'слабый GPS' }[visit.status] || visit.status;
+  return `Отметка посещения ${t} — ${st}${visit.comment ? `. ${visit.comment}` : ''}`;
+}
+
+// Разовая идемпотентная миграция старых данных при обновлении сервера:
+//  - этап "new" ("Новая задача") убран — такие задачи удаляются (по факту это
+//    ещё не начатые визиты без другой ценной информации);
+//  - этапы "waiting"/"failed" стали тегами — переносим такие задачи в "В работе"
+//    и проставляем соответствующий тег, чтобы ничего не потерять.
+// Безопасно вызывать при каждом запуске: после первого прогона таких задач больше нет.
+// Здесь и в migrateClientDefaults/migrateUserDefaults ниже — пакетный режим
+// (db.beginBatch/endBatch, см. db.js): на "чистой" базе (первый запуск после
+// импорта — сотни новых записей без ещё не проставленных полей по умолчанию)
+// эти миграции проходят по ВСЕМ записям и почти для каждой вызывают db.update —
+// без пакетного режима это O(n²) от размера базы (полная запись файла на диск
+// на каждый вызов) и на реальном объёме данных ощутимо задерживает старт сервера.
+// Фаза 22 (08.09.2026): агента "Агент 6" переименовали в "Агент 6" — логин
+// (agent6@cosmedica.local) и пароль остались прежними, поменялось только
+// отображаемое имя. На чистой установке ensureExtraAgents() (import.js) уже
+// создаёт пользователя сразу с именем "Агент 6", но на уже развёрнутой у
+// пользователя базе (Render) запись создана раньше под старым именем
+// "Агент 6" — эта миграция переименовывает её по email, идемпотентно.
+//
+// ВАЖНО — порядок вызова: должна выполняться ДО runImport() (server.js), а не
+// вместе с остальными миграциями после него. agents_clients.json теперь хранит
+// "agent": "Агент 6" у всех её точек; runImport() сопоставляет владельца клиента
+// с пользователем по ИМЕНИ (agentUserMap() в import.js), используя ИМЯ, каким
+// оно было в базе на момент запуска импорта. Если бы эта миграция выполнялась
+// после runImport() (как остальные), на не-чистой установке импорт увидел бы
+// ещё старое имя "Агент 6" в базе, не нашёл бы совпадения с "Агент 6" из
+// agents_clients.json и создал бы 131 дублирующего клиента под администратором
+// вместо того, чтобы обновить существующие записи агента — воспроизведено и
+// проверено вручную на копии базы со старым именем перед тем, как это исправить.
+function migrateAgentRenames() {
+  db.beginBatch();
+  try {
+    const begimai = db.all('users').find((u) => u.email === 'agent6@cosmedica.local' && u.role === 'agent');
+    if (begimai && begimai.name !== 'Агент 6') db.update('users', begimai.id, { name: 'Агент 6' });
+  } finally {
+    db.endBatch();
+  }
+}
+
+// Фаза 22 (08.09.2026): пользователь прислал файл "Клиенты по документам.xlsx"
+// (211 строк: № + название клиента, без заголовка) с просьбой отметить этих
+// клиентов в карточке в поле "работают по документам". Это тот же концептуально
+// признак, что уже был в карточке под названием contractStatus/«работает по
+// договору» (см. CONTRACT_STATUSES выше, введено в более ранней фазе — файл
+// был прислан повторно, структура совпадает почти полностью, просто выросла база
+// клиентов) — решено не заводить отдельное поле, а расширить существующее.
+//
+// Сопоставление имён из файла с базой (816 клиентов) сделано вне сервера —
+// нормализация + сначала подстрока, затем пересечение "отличительных" слов
+// (без родовых "ип"/"осоо"/"магазин"/"салон" и т.п.) минимум по двум словам —
+// результат сохранён в data/import/documents_status.json (82 клиента, agent —
+// имя владельца на момент сопоставления, "Агент 6" уже после переименования).
+// Совпадения на один-единственный отличительный токен (28 шт.) и полностью
+// не сопоставленные (69 шт.) сознательно НЕ включены — среди них при ручной
+// проверке нашлись ложные срабатывания на самом деле общих слов (название
+// улицы, "больница", "институт", распространённое имя) — решили не гадать
+// (см. правило "не гадать" в работе с этим пользователем) и оставить как есть,
+// не отмечая «да» без достаточной уверенности; это НЕ ошибка/недоделка, а
+// сознательное решение о пороге уверенности, задокументированное здесь и в
+// статус-документе проекта. Как и переименование агента, contractStatus у уже
+// существующих клиентов НЕ обновляется автоматически при обычном импорте (see
+// runImport() — computedFields не включает contractStatus для уже существующих
+// записей, он выставляется только при создании), поэтому нужна отдельная
+// идемпотентная миграция здесь. Апгрейдим только с "неизвестно" — если админ
+// уже вручную поставил "да" или явно "нет", не трогаем (уважаем ручную правку).
+function migrateDocumentsStatus() {
+  let list;
+  try {
+    list = JSON.parse(fs.readFileSync(path.join(IMPORT_DIR, 'documents_status.json'), 'utf8'));
+  } catch (e) {
+    return;
+  }
+  const usersByName = {};
+  db.all('users').forEach((u) => { usersByName[norm(u.name)] = u; });
+  db.beginBatch();
+  try {
+    list.forEach((row) => {
+      const owner = usersByName[norm(row.agent)];
+      if (!owner) return;
+      const client = db.all('clients').find((c) => norm(c.name) === norm(row.name) && c.ownerId === owner.id);
+      if (client && client.contractStatus === 'неизвестно') {
+        db.update('clients', client.id, { contractStatus: 'да' });
+      }
+    });
+  } finally {
+    db.endBatch();
+  }
+}
+
+// Общая логика перевода задачи со СТАРЫХ (более не существующих) этапов на
+// актуальную схему — используется и в migrateLegacyTaskStages() ниже (для уже
+// хранящихся в базе задач, на каждом старте сервера), и в /api/tasks/import
+// (см. ниже) — для задач, приходящих из файла резервной выгрузки, который мог
+// быть сделан ДО обновления кода (Фаза 22, найдено 08.09.2026: пользователь
+// загрузил файл с задачами-продажами на старом этапе "call" — они успешно
+// вставлялись в базу, но не появлялись на доске, т.к. новая доска знает только
+// TASK_STAGES/in_progress-done-not_done-archive, а миграция при старте сервера
+// применяется только к уже хранящимся записям, не к тем, что приходят через
+// импорт уже ПОСЛЕ старта). Принимает { taskType, stage, tags, report, explanation }
+// (не обязательно полный объект задачи — подходит и для "сырых" данных из файла
+// импорта, у которых ещё нет id), возвращает { stage, tags, report } — то, что
+// нужно применить (report возвращается только если его стоит переписать).
+function normalizeLegacyTaskStage({ taskType, stage, tags, report, explanation }) {
+  const result = { stage, tags: Array.isArray(tags) ? tags.slice() : [] };
+  // Найдено 18.09.2026 (жалоба «задачи лист ожидания не выгружаются» — по факту
+  // они выгружались корректно, но пропадали с самой доски «Лист ожидания» после
+  // каждого перезапуска сервера/передеплоя). 'waiting'/'failed' были этапами
+  // ТОЛЬКО на старой единой доске визитов (см. комментарий у TASK_STAGES выше) —
+  // но taskType 'waitlist' (Фаза 6, отдельная воронка) ЗАКОННО использует то же
+  // самое слово 'waiting' как свой ТЕКУЩИЙ, а не легаси, первый этап
+  // (WAITLIST_STAGES). Без проверки taskType ниже эта функция на каждом старте
+  // сервера (вызывается из migrateLegacyTaskStages()) ошибочно переводила ЛЮБУЮ
+  // задачу листа ожидания на этапе 'waiting' в 'in_progress' — этого этапа нет в
+  // WAITLIST_STAGES, поэтому renderWaitlistKanban() (фильтрует строго по
+  // WAITLIST_STAGES) переставал показывать такую задачу вообще ни в одной
+  // колонке — она оставалась в базе и корректно попадала в /api/tasks/export,
+  // просто была невидима на самой доске. Одноразовое исправление уже
+  // накопленных испорченных записей — см. отдельный проход в
+  // migrateLegacyTaskStages() ниже.
+  if (taskType !== 'waitlist' && (stage === 'waiting' || stage === 'failed')) {
+    const tagToAdd = stage === 'waiting' ? 'Лист ожидания' : 'Прогрев';
+    if (!result.tags.includes(tagToAdd)) result.tags.push(tagToAdd);
+    result.stage = 'in_progress';
+  }
+  // Фаза 22 (08.09.2026): у 'sale' была отдельная воронка со своими этапами
+  // (звонок/call, встреча/meeting, сделка/deal, провал/fail) — переводим старые
+  // задачи на новую общую схему TASK_STAGES: call/meeting (ещё не закрыта) →
+  // in_progress, deal (успех) → done, fail (провал) → not_done. Старое
+  // пояснение (explanation) отдельного поля для 'sale' в интерфейсе больше нет —
+  // переносим его содержимое в report, если сам report ещё пустой, чтобы не
+  // потерять уже записанные пояснения по старым сделкам/звонкам.
+  if (taskType === 'sale' && ['call', 'meeting', 'deal', 'fail'].includes(result.stage)) {
+    result.stage = (result.stage === 'deal') ? 'done' : (result.stage === 'fail') ? 'not_done' : 'in_progress';
+    if (!String(report || '').trim() && String(explanation || '').trim()) {
+      result.report = explanation;
+    }
+  }
+  return result;
+}
+
+function migrateLegacyTaskStages() {
+  db.beginBatch();
+  try {
+    const tasks = db.all('tasks').slice();
+    tasks.forEach((t) => {
+      if (t.stage === 'new') {
+        db.remove('tasks', t.id);
+        return;
+      }
+      const norm = normalizeLegacyTaskStage(t);
+      const patch = {};
+      if (norm.stage !== t.stage) patch.stage = norm.stage;
+      // Одноразовое исправление задач листа ожидания, уже испорченных багом
+      // выше (найдено 18.09.2026) на предыдущих перезапусках сервера — то есть
+      // taskType 'waitlist', у которых стадия по ошибке стала 'in_progress',
+      // хотя это не валидный этап WAITLIST_STAGES и через обычные действия в
+      // интерфейсе задача листа ожидания в него попасть не может (создание
+      // всегда ставит 'waiting', PUT /api/tasks/:id разрешает менять стадию
+      // waitlist-задачи только на ключ из WAITLIST_STAGES) — единственный
+      // источник такого состояния был именно этот баг. Возвращаем на 'waiting'
+      // (первый, самый безопасный этап) — 'invoiced'/'received' багом не
+      // затрагивались, чинить их не нужно. norm.stage не трогает это (сам баг
+      // уже исправлен выше проверкой taskType !== 'waitlist' в
+      // normalizeLegacyTaskStage), поэтому чиним отдельно, тем же проходом.
+      if (t.taskType === 'waitlist' && t.stage === 'in_progress') patch.stage = 'waiting';
+      if (norm.report !== undefined) patch.report = norm.report;
+      if ((t.tags || []).join('|') !== norm.tags.join('|')) patch.tags = norm.tags;
+      if (t.report === undefined) patch.report = '';
+      if (t.taskType === undefined) patch.taskType = 'visit';
+      if (t.dateChangeRequest === undefined) patch.dateChangeRequest = null;
+      if (t.explanation === undefined) patch.explanation = '';
+      if (t.visitTime === undefined) patch.visitTime = '';
+      // П.3 бэклога (08.09.2026): время визита стало диапазоном «от–до» —
+      // visitTime теперь означает «от», добавлено новое поле visitTimeTo («до»).
+      if (t.visitTimeTo === undefined) patch.visitTimeTo = '';
+      if (Object.keys(patch).length) db.update('tasks', t.id, patch);
+    });
+  } finally {
+    db.endBatch();
+  }
+}
+
+// Одноразовая очистка дублей "Задач агенту" (taskType: 'agent'), созданных
+// багом в /api/tasks/import до его исправления 18.09.2026 (см. комментарий у
+// existingKeys там же) — при каждой повторной загрузке одного и того же
+// файла резервной выгрузки такая задача вставлялась заново вместо того,
+// чтобы распознаваться как уже существующая (дедупликация по имени клиента
+// не работает для задач без клиента). Жалоба пользователя «задачи по агенту
+// при загрузке исчезли комментарии» была вызвана именно этим — рядом с
+// задачей, где уже был написан комментарий, появлялась пустая задача-копия
+// с тем же названием/сроком/датой создания, и в списке было не разобрать,
+// какая из одинаковых на вид карточек — та самая. Группируем такие задачи по
+// (title, dueDate, createdAt) — для настоящих отдельных задач это сочетание
+// с точностью до миллисекунды createdAt практически не может совпасть
+// случайно. Из каждой группы оставляем запись с наименьшим id (создана
+// раньше остальных копий), при этом переносим на неё первое непустое
+// значение comment/report/description/tags, найденное СРЕДИ ВСЕХ копий
+// группы — так что если комментарий оказался записан не на "выигравшую"
+// копию, а на одну из удаляемых, он не потеряется. Остальные копии удаляются.
+function dedupeDuplicateAgentTasks() {
+  db.beginBatch();
+  try {
+    const agentTasks = db.all('tasks').filter((t) => t.taskType === 'agent');
+    const groups = {};
+    agentTasks.forEach((t) => {
+      const key = [t.title, t.dueDate, t.createdAt].join('||');
+      (groups[key] = groups[key] || []).push(t);
+    });
+    Object.values(groups).forEach((group) => {
+      if (group.length < 2) return;
+      group.sort((a, b) => a.id - b.id);
+      const keep = group[0];
+      const rest = group.slice(1);
+      const patch = {};
+      ['comment', 'report', 'description'].forEach((f) => {
+        if (!String(keep[f] || '').trim()) {
+          const withValue = rest.find((t) => String(t[f] || '').trim());
+          if (withValue) patch[f] = withValue[f];
+        }
+      });
+      if (!(keep.tags || []).length) {
+        const withTags = rest.find((t) => (t.tags || []).length);
+        if (withTags) patch.tags = withTags.tags;
+      }
+      if (Object.keys(patch).length) db.update('tasks', keep.id, patch);
+      rest.forEach((t) => db.remove('tasks', t.id));
+    });
+  } finally {
+    db.endBatch();
+  }
+}
+
+// Разрешение сотруднику-агенту редактировать адрес/телефон/контактное лицо у СВОИХ
+// клиентов (по умолчанию выключено — эти поля защищённые, см. CLIENT_ADMIN_ONLY_FIELDS).
+// Включается администратором индивидуально по сотруднику (раздел "Команда").
+function migrateUserDefaults() {
+  db.beginBatch();
+  try {
+    db.all('users').forEach((u) => {
+      if (u.canEditClientContact === undefined) db.update('users', u.id, { canEditClientContact: false });
+    });
+  } finally {
+    db.endBatch();
+  }
+}
+
+// Проставляет значения по умолчанию для новых полей клиента у уже существующих
+// записей (созданных до появления "точка закрыта" / заметок по контакту).
+// Безопасно вызывать при каждом запуске — на уже проинициализированных клиентов не влияет.
+function migrateClientDefaults() {
+  db.beginBatch();
+  try {
+    migrateClientDefaultsBody();
+  } finally {
+    db.endBatch();
+  }
+}
+function migrateClientDefaultsBody() {
+  db.all('clients').forEach((c) => {
+    const patch = {};
+    if (c.closed === undefined) patch.closed = false;
+    if (c.closureRequested === undefined) patch.closureRequested = false;
+    if (c.closureRequestedBy === undefined) patch.closureRequestedBy = null;
+    if (c.contactNotes === undefined) patch.contactNotes = [];
+    if (c.geo === undefined) patch.geo = null;
+    if (c.visits === undefined) patch.visits = [];
+    if (c.masters === undefined) patch.masters = [];
+    if (c.extraContacts === undefined) patch.extraContacts = [];
+    if (c.inn === undefined) patch.inn = '';
+    if (c.socialContact === undefined) patch.socialContact = '';
+    if (c.bestCallTime === undefined) patch.bestCallTime = '';
+    if (c.decisionMakerName === undefined) patch.decisionMakerName = '';
+    if (c.specialRequests === undefined) patch.specialRequests = '';
+    if (c.orderWindow === undefined) patch.orderWindow = '';
+    if (c.discountTerms === undefined) patch.discountTerms = '';
+    if (c.salesPlan === undefined) patch.salesPlan = 0;
+    if (c.meetingRecords === undefined) patch.meetingRecords = [];
+    if (c.promotions === undefined) patch.promotions = [];
+    if (c.activeMonths === undefined) patch.activeMonths = [];
+    if (c.isRegularClient === undefined) patch.isRegularClient = false;
+    if (c.currentMonthRevenue === undefined) patch.currentMonthRevenue = 0;
+    if (c.currentMonthItems === undefined) patch.currentMonthItems = [];
+    if (c.monthlyAssortment === undefined) patch.monthlyAssortment = {};
+    // Фаза 15, п.6: номер маршрута — ручное поле для последовательности
+    // посещений точек агентом, ни на что автоматически не влияет.
+    if (c.routeNumber === undefined) patch.routeNumber = null;
+    // Нормализация телефона (ведущий 0 + без лишних пробелов) — прогоняется
+    // при каждом старте безусловно (не через === undefined), но сама функция
+    // идемпотентна: уже нормализованный номер не меняется повторным вызовом.
+    if (c.phone) {
+      const normalized = normalizePhone(c.phone);
+      if (normalized !== c.phone) patch.phone = normalized;
+    }
+    // Фаза 19: "тип точки" стал выпадающим списком из 8 категорий (раньше —
+    // свободный текст с кучей вариантов написания). Прогоняется безусловно
+    // при каждом старте, как и телефон выше, — сама миграция идемпотентна:
+    // уже канонический текст ("Салон красоты" и т.п.) при повторном прогоне
+    // сам на себя и отобразится (POINT_TYPE_MIGRATION содержит канонические
+    // значения ключами на самих себя), реального обновления не будет.
+    if (c.pointType) {
+      const canonical = POINT_TYPE_MIGRATION[norm(c.pointType)] || 'Другое';
+      if (canonical !== c.pointType) patch.pointType = canonical;
+    }
+    if (Object.keys(patch).length) db.update('clients', c.id, patch);
+  });
+}
+
+const PAYMENT_METHODS = ['Наличные', 'Безналичные', 'QR'];
+const CONTRACT_STATUSES = ['да', 'нет', 'неизвестно'];
+
+// "Тип точки" (Фаза 19, 04.09.2026) — раньше свободный текст, отсюда 31
+// вариант написания одного и того же (регистр, "Магазин"/"Магазины" и т.п.).
+// Пользователь подтвердил этот канонический список из 8 категорий — редкие
+// варианты (лаборатория, барбершоп, детсад, аптека, оптовый клиент и т.п.)
+// уходят в "Другое".
+const POINT_TYPES = [
+  'Магазин у дома', 'Супермаркет / сеть', 'АЗС', 'Кафе / столовая', 'Офис / бизнес-центр',
+  'Школа / вуз (буфет)', 'Больница / поликлиника', 'Киоск / павильон', 'Другое'
+];
+// Сопоставление старых свободных значений (в нормализованном виде — см.
+// norm() ниже) с канонической категорией — для одноразовой (но идемпотентной,
+// см. migrateClientDefaultsBody) миграции уже существующих клиентов. Значения,
+// которых нет в этой карте, при миграции уходят в "Другое" — не гадаем точнее.
+const POINT_TYPE_MIGRATION = Object.fromEntries(POINT_TYPES.map((t) => [t.trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' '), t]));
+
+// Правка Фазы 15 (01.09.2026, п.4): пользователь явно попросил дать агентам
+// возможность редактировать ВСЕ поля карточки своих клиентов (раньше это было
+// только у администратора/супервайзера — агент видел read-only вид с
+// заметками). Все поля из этого списка теперь редактирует и назначенный
+// агент (см. PUT /api/clients/:id — там же снята старая узкая настройка
+// canEditClientContact, полностью ею перекрытая). ownerId (переназначение
+// ответственного) сюда НЕ входит — это административное действие, остаётся
+// только у админа/супервайзера, как и было.
+const CLIENT_FULL_EDIT_FIELDS = [
+  'name', 'pointType', 'address', 'phone', 'contactName',
+  'visitDay', 'contractStatus', 'paymentMethod',
+  'socialContact', 'bestCallTime', 'decisionMakerName', 'specialRequests', 'orderWindow', 'discountTerms', 'salesPlan',
+  'routeNumber'
+];
+// Переназначение ответственного агента — только админ/супервайзер.
+const CLIENT_ADMIN_ONLY_FIELDS = ['ownerId'];
+// Поля, которые может редактировать и назначенный агент
+const CLIENT_AGENT_EDITABLE_FIELDS = ['notes'];
+
+// Фаза 42: вложения, база и загруженные через панель долги — на постоянном диске (src/paths.js).
+const { UPLOADS_DIR, DB_FILE, OVERRIDES_DIR } = require('./paths');
+
+function sendJson(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body)
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 5 * 1024 * 1024) {
+        reject(new Error('Тело запроса слишком большое'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch (e) {
+        reject(new Error('Некорректный JSON в теле запроса'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function publicUser(u) {
+  if (!u) return null;
+  return { id: u.id, name: u.name, email: u.email, role: u.role, avatarUrl: u.avatarUrl || null, canEditClientContact: !!u.canEditClientContact, monthlyPlan: u.monthlyPlan || 0, brandPlans: u.brandPlans || null, van: u.van || '', vanPlate: u.vanPlate || '', clientId: u.clientId || null };
+}
+
+function norm(s) {
+  return (s || '').toString().trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+}
+
+// Видимость записей по роли: admin/supervisor видят всё, agent — только своё
+function scoped(list, user, ownerField) {
+  if (user.role === 'admin' || user.role === 'supervisor') return list;
+  return list.filter((r) => r[ownerField] === user.id);
+}
+
+function requireAuth(handler) {
+  return async (req, res, params) => {
+    const user = auth.currentUser(req);
+    if (!user) return sendJson(res, 401, { error: 'Требуется вход в систему' });
+    req.user = user;
+    return handler(req, res, params);
+  };
+}
+
+function requireAdmin(handler) {
+  return requireAuth(async (req, res, params) => {
+    if (req.user.role !== 'admin') return sendJson(res, 403, { error: 'Недостаточно прав' });
+    return handler(req, res, params);
+  });
+}
+
+function isStaff(user) {
+  return user.role === 'admin' || user.role === 'supervisor';
+}
+
+// Удаление (клиентов, задач) разрешено только администратору и супервайзеру — не агентам
+function requireStaff(handler) {
+  return requireAuth(async (req, res, params) => {
+    if (!isStaff(req.user)) return sendJson(res, 403, { error: 'Удаление доступно только администратору и супервайзеру' });
+    return handler(req, res, params);
+  });
+}
+
+function findDuplicateClient(name, address, phone) {
+  const n = norm(name), a = norm(address), p = norm(phone).replace(/\D/g, '');
+  return db.all('clients').find((c) => {
+    const cp = norm(c.phone).replace(/\D/g, '');
+    return norm(c.name) === n && norm(c.address) === a && (p ? cp === p : true);
+  });
+}
+
+// ======================================================================
+// Отчёты по району / WhatsApp / неделе (15.10.2026). Общие функции — их
+// используют и отдельные отчёты, и недельный отчёт для PDF.
+// ======================================================================
+
+function usersIndex() {
+  const byId = {};
+  db.all('users').forEach((x) => { byId[x.id] = x; });
+  return byId;
+}
+
+// Даты периода с днём недели (не больше 62 дней).
+function periodDates(from, to) {
+  const dates = [];
+  for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z') && dates.length < 62; d.setUTCDate(d.getUTCDate() + 1)) {
+    dates.push({ key: d.toISOString().slice(0, 10), wd: WEEKDAY_BY_INDEX[d.getUTCDay()].toLowerCase() });
+  }
+  return dates;
+}
+
+// «Охват района»: на каждую дату периода — клиенты агента с этим днём визита.
+// Охвачен, если в эту дату было посещение (кроме «без GPS»/«сброшена») и/или
+// переписка в WhatsApp (агент или клиент написал).
+function coverageRows(from, to, agentId, dayFilter) {
+  const usersById = usersIndex();
+  const dates = periodDates(from, to);
+  const rows = [];
+  db.all('clients').forEach((c) => {
+    if (c.closed || !c.visitDay) return;
+    if (agentId && c.ownerId !== agentId) return;
+    const wd = c.visitDay.trim().toLowerCase();
+    if (dayFilter && wd !== dayFilter) return;
+    const myDates = dates.filter((d) => d.wd === wd);
+    if (!myDates.length) return;
+    const wa = whatsapp.messagesForClient(c, null);
+    myDates.forEach((d) => {
+      const visits = (c.visits || []).filter((v) => bishkekDate(new Date(v.at)) === d.key && !VISIT_NOT_COUNTED.includes(v.status));
+      const msgs = wa.messages.filter((m) => bishkekDate(new Date(m.t * 1000)) === d.key);
+      const out = msgs.filter((m) => m.me);
+      const inc = msgs.filter((m) => !m.me);
+      rows.push({
+        date: d.key,
+        visitDay: c.visitDay,
+        clientId: c.id,
+        clientName: c.name,
+        address: c.address || '',
+        ownerId: c.ownerId,
+        ownerName: usersById[c.ownerId] ? usersById[c.ownerId].name : '—',
+        hasPhone: wa.keys.length > 0,
+        lat: c.geo ? c.geo.lat : null,
+        lng: c.geo ? c.geo.lng : null,
+        visit: visits.length > 0,
+        visitAt: visits.map((v) => v.at).sort()[0] || null,
+        visitStatus: visits.length ? visits[0].status : null,
+        waOut: out.length,
+        waIn: inc.length,
+        waFirstAt: msgs.length ? Math.min(...msgs.map((m) => m.t)) : null,
+        waLastAt: msgs.length ? Math.max(...msgs.map((m) => m.t)) : null,
+        status: visits.length && msgs.length ? 'both' : visits.length ? 'visit' : msgs.length ? 'wa' : 'none'
+      });
+    });
+  });
+  return rows;
+}
+
+// 15.10.2026: «Общий охват за период» — без привязки к дате: клиент охвачен, если
+// за период было хотя бы одно посещение (в любой день) и/или агент-ответственный
+// написал ему в WhatsApp. Группировка — по дню визита клиента (район).
+const DAY_ORDER = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
+function periodCoverageRows(from, to, agentId) {
+  const usersById = usersIndex();
+  const inP = (d) => d >= from && d <= to;
+  const rows = [];
+  db.all('clients').forEach((c) => {
+    if (c.closed) return;
+    if (agentId && c.ownerId !== agentId) return;
+    const visits = (c.visits || []).filter((v) => !VISIT_NOT_COUNTED.includes(v.status) && inP(bishkekDate(new Date(v.at))));
+    const wa = whatsapp.messagesForClient(c, null);
+    const msgs = wa.messages.filter((m) => inP(bishkekDate(new Date(m.t * 1000))));
+    const out = msgs.filter((m) => m.me && m.a === c.ownerId);
+    const day = (c.visitDay || '').trim().toLowerCase();
+    rows.push({
+      clientId: c.id,
+      clientName: c.name,
+      address: c.address || '',
+      ownerId: c.ownerId,
+      ownerName: usersById[c.ownerId] ? usersById[c.ownerId].name : '—',
+      visitDay: day,
+      hasPhone: wa.keys.length > 0,
+      visits: visits.length,
+      lastVisitAt: visits.map((v) => v.at).sort().pop() || null,
+      waOut: out.length,
+      waIn: msgs.filter((m) => !m.me).length,
+      lastWaAt: out.length ? Math.max(...out.map((m) => m.t)) : null,
+      status: visits.length && out.length ? 'both' : visits.length ? 'visit' : out.length ? 'wa' : 'none'
+    });
+  });
+  return rows;
+}
+// Сводка по дням визита (районам): клиентов, посещено, написали, охвачено, ни того ни другого.
+function groupByVisitDay(rows) {
+  const map = new Map();
+  rows.forEach((r) => {
+    const k = r.visitDay || '';
+    if (!map.has(k)) map.set(k, { day: k, total: 0, visited: 0, wa: 0, covered: 0, nothing: 0 });
+    const g = map.get(k);
+    g.total++;
+    if (r.visits) g.visited++;
+    if (r.waOut) g.wa++;
+    if (r.visits || r.waOut) g.covered++; else g.nothing++;
+  });
+  const rank = (d) => { const i = DAY_ORDER.indexOf(d); return i < 0 ? 99 : i; };
+  return [...map.values()].sort((a, b) => rank(a.day) - rank(b.day));
+}
+
+// «Клиенты без ответа до 20:00». Обращение = первое сообщение клиента в чате
+// (номер агента × номер клиента) после последнего ответа агента. Срок — 20:00
+// того же дня по Бишкеку, если клиент написал после 20:00 — 20:00 следующего дня.
+// none — срок прошёл, ответа нет; late — ответ после срока. Обращения с
+// ненаступившим сроком не попадают. byChatAgentOnly — только чаты номера агента.
+function unansweredRows(from, to, agentId, byChatAgentOnly) {
+  const usersById = usersIndex();
+  const TZ = 6 * 3600;
+  const deadlineOf = (t) => {
+    const local = t + TZ;
+    const cut = Math.floor(local / 86400) * 86400 + TASK_DEADLINE_HOUR * 3600;
+    return (local < cut ? cut : cut + 86400) - TZ;
+  };
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = [];
+  db.all('clients').forEach((c) => {
+    if (c.closed) return;
+    const r = whatsapp.messagesForClient(c, null);
+    const chats = new Map();
+    r.messages.forEach((m) => {
+      const key = `${m.a}|${m.k}`;
+      if (!chats.has(key)) chats.set(key, []);
+      chats.get(key).push(m);
+    });
+    chats.forEach((msgs) => {
+      msgs.sort((a, b) => a.t - b.t);
+      const chatAgent = msgs[0].a;
+      if (agentId && chatAgent !== agentId && (byChatAgentOnly || c.ownerId !== agentId)) return;
+      let pending = null;
+      let count = 0;
+      const flush = (reply) => {
+        if (!pending) return;
+        const deadline = deadlineOf(pending.t);
+        const d = bishkekDate(new Date(pending.t * 1000));
+        const late = reply && reply.t > deadline;
+        const none = !reply && deadline < nowSec;
+        if ((late || none) && d >= from && d <= to) {
+          rows.push({
+            clientId: c.id,
+            clientName: c.name,
+            ownerName: usersById[c.ownerId] ? usersById[c.ownerId].name : '—',
+            agentId: chatAgent,
+            agentName: usersById[chatAgent] ? usersById[chatAgent].name : String(chatAgent),
+            phone: whatsapp.displayKey(pending.k),
+            msgAt: pending.t,
+            msgText: String(pending.x || '').replace(/\s+/g, ' ').slice(0, 160),
+            msgCount: count,
+            deadline,
+            replyAt: reply ? reply.t : null,
+            status: none ? 'none' : 'late'
+          });
+        }
+        pending = null;
+        count = 0;
+      };
+      msgs.forEach((m) => {
+        if (m.me) flush(m);
+        else { if (!pending) pending = m; count++; }
+      });
+      flush(null);
+    });
+  });
+  rows.sort((a, b) => b.msgAt - a.msgAt);
+  return rows;
+}
+
+// ---- Снимки показателей по срезам продаж (для сравнения «неделя к неделе») ----
+// На каждом старте сервера после импорта по текущему срезу каждого агента
+// считаем: АКБ (купившие в этом месяце карточки агента), ОКБ (все не закрытые
+// карточки агента), регулярный ассортимент всего/куплено, продажи (Итого среза),
+// покупателей по срезу. Ключ — дата среза (asOf). Хранится в настройке
+// salesSnapshots (db.json на постоянном диске) + статичный файл
+// data/import/sales_snapshots.json (заполнен задним числом для срезов 06.10/09.10).
+function computeSalesSnapshot(agent) {
+  const fact = agentSalesFact(agent.name);
+  const cards = db.all('clients').filter((c) => c.ownerId === agent.id && !c.closed);
+  const fresh = withFreshCurrentMonth(cards);
+  let regTotal = 0;
+  let regBought = 0;
+  fresh.forEach((c) => {
+    (c.regularAssortment || []).forEach((p) => { regTotal++; if (p.atRisk === false) regBought++; });
+  });
+  const buyers = (fact.clients || []).length || fresh.filter((c) => (c.currentMonthRevenue || 0) > 0).length;
+  return {
+    asOf: fact.asOf || null,
+    period: fact.period || '',
+    total: fact.total || 0,
+    okb: cards.length,
+    akb: fresh.filter((c) => (c.currentMonthRevenue || 0) > 0).length,
+    regTotal,
+    regBought,
+    buyers,
+    invoices: fact.invoices || 0
+  };
+}
+function loadPrevMonthChecks() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'import', 'prev_month_checks.json'), 'utf8')); } catch (e) { return {}; }
+}
+function loadStaticSnapshots() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'import', 'sales_snapshots.json'), 'utf8')); } catch (e) { return {}; }
+}
+function recordSalesSnapshots() {
+  const stored = db.getSetting('salesSnapshots', {}) || {};
+  let changed = false;
+  db.all('users').filter((u) => u.role === 'agent').forEach((a) => {
+    const snap = computeSalesSnapshot(a);
+    if (!snap.asOf) return;
+    stored[a.name] = stored[a.name] || {};
+    if (JSON.stringify(stored[a.name][snap.asOf]) !== JSON.stringify(snap)) { stored[a.name][snap.asOf] = snap; changed = true; }
+  });
+  if (changed) db.setSetting('salesSnapshots', stored);
+  return stored;
+}
+function snapshotsOf(agentName) {
+  const st = loadStaticSnapshots()[agentName] || {};
+  const db1 = (db.getSetting('salesSnapshots', {}) || {})[agentName] || {};
+  return Object.assign({}, st, db1);
+}
+// Последний снимок на дату (asOf ≤ date) в том же месяце; иначе — «начало месяца» (всё по нулям).
+function snapshotOn(agentName, date) {
+  const month = date.slice(0, 7);
+  const all = snapshotsOf(agentName);
+  const keys = Object.keys(all).filter((k) => k <= date && k.slice(0, 7) === month).sort();
+  if (!keys.length) return { asOf: null, monthStart: true, total: 0, akb: 0, okb: null, regTotal: null, regBought: 0, buyers: 0 };
+  return all[keys[keys.length - 1]];
+}
+// Рабочие дни (Пн–Сб) месяца и прошедшие на дату.
+function workdays(fromKey, toKey) {
+  return periodDates(fromKey, toKey).filter((d) => d.wd !== 'воскресенье').length;
+}
+
+// ---- Недельный отчёт по агентам (PDF) ----
+const WEEK_NORMS = { visitPct: 85, coveragePct: 85, phonePct: 90, geoPct: 80 };
+function weekReport(from, to) {
+  const usersById = usersIndex();
+  const agents = db.all('users').filter((u) => u.role === 'agent');
+  const cov = coverageRows(from, to, null, '');
+  const pcov = periodCoverageRows(from, to, null);
+  const unans = unansweredRows(from, to, null, false);
+  const allTasks = db.all('tasks');
+  const prevMonth = MONTH_ORDER[MONTH_ORDER.length - 1];
+  const dates = periodDates(from, to).filter((d) => d.wd !== 'воскресенье');
+  const ADDED_RE = /Добавлено (\d{2})\.(\d{2})\.(\d{4})/;
+  const addedOn = (c) => {
+    const m = ADDED_RE.exec(c.notes || '');
+    return m ? `${m[3]}-${m[2]}-${m[1]}` : (c.fromImport ? null : (c.createdAt ? bishkekDate(new Date(c.createdAt)) : null));
+  };
+  // Сообщения агентов клиентам базы по дням: agentId|date -> { out, clients:Set }.
+  const waByDay = new Map();
+  // 15.10.2026: охват WhatsApp за весь период (не по дню визита): клиенты (по
+  // ответственному агенту), которым агент написал хотя бы раз за период.
+  const waPeriodWritten = new Set();
+  db.all('clients').forEach((c) => {
+    whatsapp.messagesForClient(c, null).messages.forEach((m) => {
+      if (!m.me) return;
+      const d = bishkekDate(new Date(m.t * 1000));
+      if (d < from || d > to) return;
+      if (m.a === c.ownerId) waPeriodWritten.add(c.id);
+      const k = `${m.a}|${d}`;
+      const x = waByDay.get(k) || { out: 0, clients: new Set() };
+      x.out++;
+      x.clients.add(c.id);
+      waByDay.set(k, x);
+    });
+  });
+  // Все отметки агентов по дням (любые клиенты, засчитанные).
+  const visitsByDay = new Map();
+  db.all('clients').forEach((c) => {
+    (c.visits || []).forEach((v) => {
+      if (VISIT_NOT_COUNTED.includes(v.status)) return;
+      const d = bishkekDate(new Date(v.at));
+      if (d < from || d > to) return;
+      const k = `${v.agentId}|${d}`;
+      visitsByDay.set(k, (visitsByDay.get(k) || 0) + 1);
+    });
+  });
+
+  const result = agents.map((a) => {
+    const cards = db.all('clients').filter((c) => c.ownerId === a.id && !c.closed);
+    const fresh = withFreshCurrentMonth(cards);
+    const myCov = cov.filter((r) => r.ownerId === a.id); // по датам (район дня) — для расшифровки по дням
+    // Общий охват за период (без привязки к дате) — для баллов и таблицы по районам.
+    const myP = pcov.filter((r) => r.ownerId === a.id);
+    const visited = myP.filter((r) => r.visits > 0).length;
+    const covered = myP.filter((r) => r.visits > 0 || r.waOut > 0).length;
+    const nothing = myP.filter((r) => !r.visits && !r.waOut);
+    const myUnans = unans.filter((r) => r.agentId === a.id);
+
+    // Продажи: факт на конец недели против плана по графику рабочих дней.
+    const endSnap = snapshotOn(a.name, to);
+    const startSnap = snapshotOn(a.name, bishkekDate(new Date(new Date(from + 'T00:00:00Z').getTime() - 86400000)));
+    const monthStart = to.slice(0, 8) + '01';
+    const monthEndD = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(5, 7)), 0));
+    const monthEnd = monthEndD.toISOString().slice(0, 10);
+    const factAsOf = endSnap.asOf || to;
+    const wdTotal = workdays(monthStart, monthEnd);
+    const wdDone = workdays(monthStart, factAsOf);
+    const plan = a.monthlyPlan || 0;
+    const planToDate = plan ? Math.round(plan * wdDone / wdTotal) : 0;
+    // Продажи за неделю — по датам накладных текущего среза (если есть), иначе разница снимков.
+    const byDate = (agentSalesFact(a.name).byDate) || {};
+    const hasByDate = Object.keys(byDate).length > 0;
+    const weekSales = hasByDate
+      ? Object.keys(byDate).filter((k) => k >= from && k <= to).reduce((x, k) => x + (byDate[k].sum || 0), 0)
+      : (endSnap.total || 0) - (startSnap.asOf && startSnap.asOf.slice(0, 7) === to.slice(0, 7) ? (startSnap.total || 0) : 0);
+
+    // Недопродано: доля не купленного регулярного ассортимента на начало и конец недели.
+    const shareOf = (s, fallbackTotal) => {
+      const tot = s.regTotal != null ? s.regTotal : fallbackTotal;
+      return tot ? Math.round((1 - (s.regBought || 0) / tot) * 1000) / 10 : null;
+    };
+    let regTotalNow = 0;
+    fresh.forEach((c) => { regTotalNow += (c.regularAssortment || []).length; });
+    const shortEnd = shareOf(endSnap, regTotalNow);
+    const shortStart = startSnap.monthStart || (startSnap.asOf && startSnap.asOf.slice(0, 7) !== to.slice(0, 7)) ? (regTotalNow ? 100 : null) : shareOf(startSnap, regTotalNow);
+
+    // АКБ / ОКБ на начало и конец недели.
+    const okb = cards.length;
+    const akbEnd = endSnap.akb || 0;
+    const akbStart = startSnap.monthStart ? 0 : (startSnap.akb || 0);
+    const akbPctEnd = okb ? Math.round(akbEnd / okb * 1000) / 10 : 0;
+    const akbPctStart = okb ? Math.round(akbStart / okb * 1000) / 10 : 0;
+
+    // Средний чек = продажи / число накладных (уникальные «Реализация …» в срезе)
+    // против прошлого месяца (data/import/prev_month_checks.json — по полным файлам
+    // прошлого месяца). Нет данных за прошлый месяц — пункт не засчитывается.
+    const avgNow = endSnap.invoices ? Math.round((endSnap.total || 0) / endSnap.invoices) : 0;
+    const prevChecks = loadPrevMonthChecks();
+    const prevA = prevChecks[a.name];
+    const avgPrev = prevA && prevA.invoices ? Math.round(prevA.total / prevA.invoices) : 0;
+    const prevLabel = prevChecks._month || prevMonth;
+
+    // База: номера и координаты.
+    const withPhone = cards.filter((c) => whatsapp.phoneKeysFromString(c.phone).length || (c.waPhones || []).length || (c.extraContacts || []).some((x) => x.phone)).length;
+    const withGeo = cards.filter((c) => c.geo).length;
+
+    // Просроченные задачи (на конец недели ещё не закрыты).
+    const overdue = allTasks.filter((t) => t.assigneeId === a.id && t.dueDate && t.dueDate <= to && isActiveStage(t)).length;
+
+    // Новые клиенты, добавленные в базу за неделю.
+    const newClients = db.all('clients').filter((c) => {
+      if (c.ownerId !== a.id) return false;
+      const added = addedOn(c);
+      return added && added >= from && added <= to;
+    });
+
+    const pct = (x, y) => (y ? Math.round(x / y * 1000) / 10 : 0);
+    const metrics = [
+      { key: 'visits', label: 'Посещения за период (хоть раз)', value: `${pct(visited, myP.length)}%`, detail: `${visited} из ${myP.length} клиентов посещены хотя бы раз`, norm: `≥ ${WEEK_NORMS.visitPct}%`, ok: myP.length > 0 && pct(visited, myP.length) >= WEEK_NORMS.visitPct },
+      { key: 'coverage', label: 'Общий охват (посещение или написал в WhatsApp)', value: `${pct(covered, myP.length)}%`, detail: `${covered} из ${myP.length}, ни того ни другого — ${nothing.length}`, norm: `≥ ${WEEK_NORMS.coveragePct}%`, ok: myP.length > 0 && pct(covered, myP.length) >= WEEK_NORMS.coveragePct },
+      { key: 'answers', label: 'Ответы клиентам до 20:00', value: String(myUnans.length), detail: `нет ответа — ${myUnans.filter((r) => r.status === 'none').length}, позже срока — ${myUnans.filter((r) => r.status === 'late').length}`, norm: '0 без ответа', ok: myUnans.length === 0 },
+      { key: 'sales', label: 'Продажи к плану по графику', value: plan ? `${pct(endSnap.total || 0, planToDate)}%` : 'план не задан', detail: `факт ${fmtSom(endSnap.total || 0)} на ${endSnap.asOf ? endSnap.asOf.split('-').reverse().join('.') : '—'}, по графику ${fmtSom(planToDate)} (${wdDone} из ${wdTotal} раб. дн.), за неделю +${fmtSom(weekSales)}`, norm: '≥ 100% графика', ok: plan > 0 && (endSnap.total || 0) >= planToDate },
+      { key: 'shortfall', label: 'Недопродано (доля регулярного ассортимента)', value: shortEnd != null ? `${shortEnd}%` : '—', detail: shortStart != null ? `было ${shortStart}% на начало недели` : 'нет данных на начало недели', norm: 'снизилась за неделю', ok: shortEnd != null && shortStart != null && shortEnd < shortStart },
+      { key: 'phones', label: 'Клиенты с номером телефона', value: `${pct(withPhone, cards.length)}%`, detail: `${withPhone} из ${cards.length}, без номера — ${cards.length - withPhone}`, norm: `≥ ${WEEK_NORMS.phonePct}%`, ok: pct(withPhone, cards.length) >= WEEK_NORMS.phonePct },
+      { key: 'geo', label: 'Клиенты с координатами точки', value: `${pct(withGeo, cards.length)}%`, detail: `${withGeo} из ${cards.length}`, norm: `≥ ${WEEK_NORMS.geoPct}%`, ok: pct(withGeo, cards.length) >= WEEK_NORMS.geoPct },
+      { key: 'overdue', label: 'Просроченные задачи', value: String(overdue), detail: 'срок до конца недели, не закрыты', norm: '0', ok: overdue === 0 },
+      { key: 'newClients', label: 'Новые клиенты в базе', value: String(newClients.length), detail: newClients.slice(0, 3).map((c) => c.name).join(', ') + (newClients.length > 3 ? '…' : ''), norm: '≥ 1', ok: newClients.length >= 1 },
+      { key: 'akb', label: 'АКБ / ОКБ', value: `${akbPctEnd}%`, detail: `${akbEnd} из ${okb}; на начало недели ${akbPctStart}% (${akbStart})`, norm: 'выше, чем неделю назад', ok: akbPctEnd > akbPctStart },
+      { key: 'avgCheck', label: 'Средний чек (на накладную)', value: avgNow ? fmtSom(avgNow) : '—', detail: avgNow ? `${endSnap.invoices} накл.; ${avgPrev ? `${prevLabel} — ${fmtSom(avgPrev)}` : `нет данных за ${prevLabel}`}` : 'нет данных о накладных в срезе', norm: '≥ прошлого месяца', ok: avgNow > 0 && avgPrev > 0 && avgNow >= avgPrev }
+    ];
+    const score = metrics.filter((m) => m.ok).length;
+
+    // По дням Пн–Сб.
+    const days = dates.map((d) => {
+      const rs = myCov.filter((r) => r.date === d.key);
+      return { date: d.key, wd: d.wd, total: rs.length, visit: rs.filter((r) => r.visit).length, wa: rs.filter((r) => r.waOut > 0).length, nothing: rs.filter((r) => !r.visit && r.waOut === 0).length };
+    });
+
+    // Расшифровка по дням Пн–Пт (без баллов).
+    const daily = periodDates(from, to).filter((x) => !['суббота', 'воскресенье'].includes(x.wd)).map((x) => {
+      const rs = myCov.filter((r) => r.date === x.key);
+      const w = waByDay.get(`${a.id}|${x.key}`) || { out: 0, clients: new Set() };
+      const un = myUnans.filter((r) => bishkekDate(new Date(r.msgAt * 1000)) === x.key);
+      const sale = byDate[x.key] || { sum: 0, invoices: 0 };
+      return {
+        date: x.key, wd: x.wd,
+        district: rs.length,
+        districtVisited: rs.filter((r) => r.visit).length,
+        districtWa: rs.filter((r) => r.waOut > 0).length,
+        districtNothing: rs.filter((r) => !r.visit && r.waOut === 0).length,
+        visitsAll: visitsByDay.get(`${a.id}|${x.key}`) || 0,
+        waOut: w.out,
+        waClients: w.clients.size,
+        unanswered: un.filter((r) => r.status === 'none').length,
+        late: un.filter((r) => r.status === 'late').length,
+        sales: hasByDate ? sale.sum : null,
+        invoices: hasByDate ? sale.invoices : null,
+        newClients: newClients.filter((c) => addedOn(c) === x.key).length
+      };
+    });
+
+    // Топ-10: кого не охватили; у кого больше всего недопродано.
+    const notCovered = nothing.map((r) => ({ name: r.clientName, address: r.address, visitDay: r.visitDay, hasPhone: r.hasPhone }))
+      .sort((x, y) => ((DAY_ORDER.indexOf(x.visitDay) + 1 || 99) - (DAY_ORDER.indexOf(y.visitDay) + 1 || 99)) || x.name.localeCompare(y.name, 'ru')).slice(0, 10);
+    const districts = groupByVisitDay(myP);
+    const topShort = fresh.map((c) => ({ name: c.name, risk: (c.regularAssortment || []).filter((p) => p.atRisk).length, total: (c.regularAssortment || []).length, sample: (c.regularAssortment || []).filter((p) => p.atRisk).slice(0, 3).map((p) => p.product) }))
+      .filter((x) => x.risk > 0).sort((x, y) => y.risk - x.risk).slice(0, 10);
+
+    // Охват WhatsApp за период (без баллов): написал своим клиентам хоть раз за период.
+    const waWritten = cards.filter((c) => waPeriodWritten.has(c.id)).length;
+    const waPeriod = { written: waWritten, total: cards.length, withPhone, pct: pct(waWritten, cards.length), pctOfPhones: pct(waWritten, withPhone) };
+    return { agentId: a.id, agentName: a.name, score, max: metrics.length, metrics, waPeriod, days, districts, daily, notCovered, topShort, nothingCount: nothing.length, unanswered: myUnans.length };
+  });
+  result.sort((x, y) => y.score - x.score || x.agentName.localeCompare(y.agentName, 'ru'));
+  result.forEach((r, i) => { r.rank = i + 1; });
+  return { from, to, generatedAt: new Date().toISOString(), norms: WEEK_NORMS, agents: result };
+}
+function fmtSom(n) {
+  return `${Math.round(n || 0).toLocaleString('ru-RU').replace(/ /g, ' ')} сом`;
+}
+
+function register(router) {
+  // ---- Аутентификация ----
+
+  router.post('/api/login', async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const { email, password } = body;
+    const user = db.all('users').find((u) => u.email.toLowerCase() === String(email || '').toLowerCase());
+    if (!user || !auth.verifyPassword(password, user.passwordHash)) {
+      return sendJson(res, 401, { error: 'Неверный email или пароль' });
+    }
+    auth.createSessionForUser(res, user.id);
+    sendJson(res, 200, { user: publicUser(user) });
+  });
+
+  router.post('/api/logout', (req, res) => {
+    auth.logout(req, res);
+    sendJson(res, 200, { ok: true });
+  });
+
+  router.get('/api/me', requireAuth(async (req, res) => {
+    sendJson(res, 200, {
+      user: publicUser(req.user),
+      stages: isStaff(req.user) ? TASK_STAGES : TASK_STAGES.filter((s) => !STAFF_ONLY_STAGES.includes(s.key)),
+      waitlistStages: isStaff(req.user) ? WAITLIST_STAGES : WAITLIST_STAGES.filter((s) => !WAITLIST_STAFF_ONLY_STAGES.includes(s.key)),
+      waitlistTags: WAITLIST_TAGS,
+      saleTags: SALE_TAGS,
+      paymentMethods: PAYMENT_METHODS,
+      pointTypes: POINT_TYPES,
+      contractStatuses: CONTRACT_STATUSES,
+      taskTags: TASK_TAGS,
+      // Правка 01.09.2026: чтобы фронтенд мог показать реальную дату и явно
+      // предупредить, что данные о продажах/акциях за текущий месяц ещё не
+      // загружены (см. withFreshCurrentMonth выше).
+      serverDate: new Date().toISOString(),
+      salesMonths: MONTH_ORDER,
+      latestSalesMonth: MONTH_ORDER[MONTH_ORDER.length - 1],
+      currentMonthDataFresh: isCurrentMonthDataFresh()
+    });
+  }));
+
+  // ---- Пользователи (команда) ----
+
+  router.get('/api/users', requireAuth(async (req, res) => {
+    const users = db.all('users').filter((u) => u.role !== 'client').map(publicUser);
+    if (req.user.role === 'admin') return sendJson(res, 200, { users });
+    sendJson(res, 200, { users: users.map((u) => ({ id: u.id, name: u.name, role: u.role })) });
+  }));
+
+  router.post('/api/users', requireAdmin(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const { name, email, password, role } = body;
+    if (!name || !email || !password) return sendJson(res, 400, { error: 'Заполните имя, email и пароль' });
+    if (db.all('users').some((u) => u.email.toLowerCase() === email.toLowerCase())) {
+      return sendJson(res, 400, { error: 'Пользователь с таким email уже существует' });
+    }
+    const validRoles = ['admin', 'supervisor', 'agent'];
+    const user = db.insert('users', {
+      name,
+      email,
+      passwordHash: auth.hashPassword(password),
+      role: validRoles.includes(role) ? role : 'agent',
+      canEditClientContact: false,
+      createdAt: new Date().toISOString()
+    });
+    sendJson(res, 201, { user: publicUser(user) });
+  }));
+
+  router.delete('/api/users/:id', requireAdmin(async (req, res, params) => {
+    if (Number(params.id) === req.user.id) return sendJson(res, 400, { error: 'Нельзя удалить самого себя' });
+    const ok = db.remove('users', params.id);
+    sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'Не найдено' });
+  }));
+
+  // ---- Смена пароля (09.10.2026) ----
+  // Раньше пароль задавался только при создании сотрудника — у всех оставались
+  // стандартные admin123/super123/agent123. Пароль живёт в db.json на постоянном
+  // диске Render — деплой его не сбрасывает (ensureTeam/ensureExtraAgents пароли
+  // существующих пользователей не трогают). После смены — выход из всех остальных
+  // сессий этого сотрудника.
+  const PASSWORD_MIN = 6;
+  // Администратор задаёт новый пароль любому сотруднику (старый не нужен).
+  router.put('/api/users/:id/password', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user) return sendJson(res, 404, { error: 'Не найдено' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const pwd = String(body.password || '');
+    if (pwd.length < PASSWORD_MIN) return sendJson(res, 400, { error: `Пароль — не короче ${PASSWORD_MIN} символов` });
+    db.update('users', user.id, { passwordHash: auth.hashPassword(pwd), passwordChangedAt: new Date().toISOString() });
+    db.deleteSessionsOfUser(user.id, auth.currentToken(req));
+    sendJson(res, 200, { ok: true });
+  }));
+
+  // Любой сотрудник меняет свой пароль сам (нужен текущий пароль).
+  router.post('/api/me/password', requireAuth(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const user = db.find('users', req.user.id);
+    if (!user || !auth.verifyPassword(String(body.oldPassword || ''), user.passwordHash)) {
+      return sendJson(res, 400, { error: 'Текущий пароль указан неверно' });
+    }
+    const pwd = String(body.newPassword || '');
+    if (pwd.length < PASSWORD_MIN) return sendJson(res, 400, { error: `Новый пароль — не короче ${PASSWORD_MIN} символов` });
+    db.update('users', user.id, { passwordHash: auth.hashPassword(pwd), passwordChangedAt: new Date().toISOString() });
+    db.deleteSessionsOfUser(user.id, auth.currentToken(req));
+    sendJson(res, 200, { ok: true });
+  }));
+
+  // Разрешение агенту редактировать адрес/телефон/контактное лицо у своих клиентов —
+  // включает/выключает только администратор, по умолчанию выключено.
+  router.put('/api/users/:id/permissions', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user) return sendJson(res, 404, { error: 'Не найдено' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const updated = db.update('users', params.id, { canEditClientContact: !!body.canEditClientContact });
+    sendJson(res, 200, { user: publicUser(updated) });
+  }));
+
+  // Общий план продаж агента на месяц (Фаза 36, 21.09.2026) — по решению
+  // пользователя, план ведём НЕ по каждому клиенту (поле salesPlan у клиента
+  // так и осталось незаполненным ни у одного из 720 клиентов), а одной цифрой
+  // на агента в месяц — её же показываем на дашборде («План vs факт по
+  // агентам»). Редактируется только админом на странице «Команда».
+  router.put('/api/users/:id/plan', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user) return sendJson(res, 404, { error: 'Не найдено' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const plan = Math.max(0, Math.round(Number(body.monthlyPlan)) || 0);
+    const updated = db.update('users', params.id, { monthlyPlan: plan });
+    sendJson(res, 200, { user: publicUser(updated) });
+  }));
+
+  // Аватар сотрудника — для быстрого визуального распознавания в списках/канбане
+  router.post('/api/users/:id/avatar', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user) return sendJson(res, 404, { error: 'Не найдено' });
+    let parsed;
+    try {
+      parsed = await parseMultipart(req, 5 * 1024 * 1024);
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+    const file = parsed.files[0];
+    if (!file || !/^image\//.test(file.mimeType)) {
+      return sendJson(res, 400, { error: 'Нужен файл изображения' });
+    }
+    const avatarsDir = path.join(UPLOADS_DIR, 'avatars');
+    fs.mkdirSync(avatarsDir, { recursive: true });
+    const ext = (file.mimeType.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '');
+    const storedName = `user${user.id}_${Date.now()}.${ext}`;
+    fs.writeFileSync(path.join(avatarsDir, storedName), file.data);
+    const updated = db.update('users', user.id, { avatarUrl: `/uploads/avatars/${storedName}` });
+    sendJson(res, 200, { user: publicUser(updated) });
+  }));
+
+  // Резервная копия одной кнопкой: db.json + все вложения одним zip-файлом.
+  router.get('/api/backup', requireAdmin(async (req, res) => {
+    const entries = [];
+    const dbPath = DB_FILE;
+    if (fs.existsSync(dbPath)) entries.push({ name: 'db.json', data: fs.readFileSync(dbPath) });
+
+    function walk(dir, prefix) {
+      if (!fs.existsSync(dir)) return;
+      fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+        const full = path.join(dir, entry.name);
+        const rel = prefix + '/' + entry.name;
+        if (entry.isDirectory()) walk(full, rel);
+        else entries.push({ name: 'uploads' + rel, data: fs.readFileSync(full) });
+      });
+    }
+    walk(UPLOADS_DIR, '');
+
+    const zipBuf = buildZip(entries);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="backup-${dateStr}.zip"`,
+      'Content-Length': zipBuf.length
+    });
+    res.end(zipBuf);
+  }));
+
+  // ---- Клиенты (контрагенты) ----
+
+  router.get('/api/clients', requireAuth(async (req, res) => {
+    sendJson(res, 200, { clients: withFreshCurrentMonth(scoped(db.all('clients'), req.user, 'ownerId')) });
+  }));
+
+  router.post('/api/clients', requireAuth(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.name) return sendJson(res, 400, { error: 'Укажите название контрагента' });
+
+    if (!body.force) {
+      const dup = findDuplicateClient(body.name, body.address, body.phone);
+      if (dup) {
+        return sendJson(res, 409, {
+          error: 'Похоже, такой контрагент уже есть (совпадают название, адрес и телефон)',
+          duplicate: dup
+        });
+      }
+    }
+
+    const isAgent = req.user.role === 'agent';
+    const ownerId = !isAgent && body.ownerId ? Number(body.ownerId) : req.user.id;
+
+    const client = db.insert('clients', {
+      name: body.name,
+      pointType: POINT_TYPES.includes(body.pointType) ? body.pointType : '',
+      address: body.address || '',
+      phone: body.phone || '',
+      contactName: body.contactName || '',
+      visitDay: body.visitDay || '',
+      contractStatus: CONTRACT_STATUSES.includes(body.contractStatus) ? body.contractStatus : 'неизвестно',
+      paymentMethod: PAYMENT_METHODS.includes(body.paymentMethod) ? body.paymentMethod : '',
+      discountTerms: body.discountTerms || '',
+      salesPlan: Number(body.salesPlan) || 0,
+      notes: body.notes || '',
+      ownerId,
+      isOffRoute: isAgent ? true : !!body.isOffRoute,
+      pendingApproval: isAgent, // новый клиент от агента ждёт подтверждения админом
+      regularAssortment: [],
+      testAssortment: [],
+      debtAmount: 0,
+      debtOverdue: false,
+      debtAsOf: null,
+      closed: false,
+      closureRequested: false,
+      closureRequestedBy: null,
+      contactNotes: [],
+      masters: [],
+      extraContacts: [],
+      socialContact: body.socialContact || '',
+      bestCallTime: body.bestCallTime || '',
+      decisionMakerName: body.decisionMakerName || '',
+      specialRequests: body.specialRequests || '',
+      orderWindow: body.orderWindow || '',
+      routeNumber: body.routeNumber ? (Number(body.routeNumber) || null) : null,
+      meetingRecords: [],
+      createdBy: req.user.id,
+      createdAt: new Date().toISOString()
+    });
+    sendJson(res, 201, { client });
+  }));
+
+  router.put('/api/clients/:id', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    const owns = client.ownerId === req.user.id;
+    if (!isStaff(req.user) && !owns) return sendJson(res, 403, { error: 'Недостаточно прав' });
+
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+
+    const patch = {};
+    // ownerId (переназначение ответственного агента) — административное
+    // действие, только админ/супервайзер, как и pendingApproval/isOffRoute.
+    if (isStaff(req.user)) {
+      if (body.ownerId !== undefined) patch.ownerId = Number(body.ownerId);
+      if (body.pendingApproval !== undefined) patch.pendingApproval = !!body.pendingApproval;
+      if (body.isOffRoute !== undefined) patch.isOffRoute = !!body.isOffRoute;
+      // Радиус засчёта посещения для точки (26.10.2026) — только админ/супервайзер; пусто = 30 по умолчанию.
+      if (body.visitRadius !== undefined) { const r = Number(body.visitRadius); patch.visitRadius = r > 0 ? Math.min(2000, Math.max(10, Math.round(r))) : null; }
+    }
+    // Фаза 15, п.4: остальные поля карточки редактирует и админ/супервайзер, и
+    // назначенный агент (для СВОИХ клиентов — проверка owns/isStaff уже прошла
+    // в самом начале обработчика). Раньше здесь была узкая настройка
+    // canEditClientContact (только адрес/телефон/контакт, только у отдельных
+    // агентов по решению админа) — по прямой просьбе пользователя снята,
+    // теперь полный доступ у любого агента к своим клиентам без переключателя.
+    CLIENT_FULL_EDIT_FIELDS.forEach((f) => {
+      if (body[f] === undefined) return;
+      if (f === 'contractStatus' && !CONTRACT_STATUSES.includes(body.contractStatus)) return;
+      if (f === 'paymentMethod' && body.paymentMethod && !PAYMENT_METHODS.includes(body.paymentMethod)) return;
+      if (f === 'pointType' && body.pointType && !POINT_TYPES.includes(body.pointType)) return;
+      if (f === 'salesPlan') { patch.salesPlan = Number(body.salesPlan) || 0; return; }
+      if (f === 'routeNumber') { patch.routeNumber = body.routeNumber === '' || body.routeNumber === undefined ? null : (Number(body.routeNumber) || null); return; }
+      patch[f] = f === 'phone' ? normalizePhone(body[f]) : body[f];
+    });
+    CLIENT_AGENT_EDITABLE_FIELDS.forEach((f) => {
+      if (body[f] !== undefined) patch[f] = body[f];
+    });
+
+    sendJson(res, 200, { client: db.update('clients', params.id, patch) });
+  }));
+
+  router.post('/api/clients/:id/approve', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    sendJson(res, 200, { client: db.update('clients', params.id, { pendingApproval: false }) });
+  }));
+
+  router.delete('/api/clients/:id', requireStaff(async (req, res, params) => {
+    const ok = db.remove('clients', params.id);
+    sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'Не найдено' });
+  }));
+
+  // Массовая смена ответственного агента (админ/супервайзер)
+  router.post('/api/clients/bulk-reassign', requireStaff(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const ids = Array.isArray(body.ids) ? body.ids.map(Number) : [];
+    const ownerId = Number(body.ownerId);
+    const agent = db.find('users', ownerId);
+    if (!ids.length) return sendJson(res, 400, { error: 'Не выбрано ни одного клиента' });
+    if (!agent || agent.role !== 'agent') return sendJson(res, 400, { error: 'Укажите корректного агента' });
+    let updated = 0;
+    ids.forEach((id) => { if (db.update('clients', id, { ownerId })) updated++; });
+    sendJson(res, 200, { updated });
+  }));
+
+  // ---- "Точка закрыта": агент предлагает закрыть, админ/супервайзер подтверждает ----
+
+  router.post('/api/clients/:id/request-closure', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    sendJson(res, 200, { client: db.update('clients', params.id, { closureRequested: true, closureRequestedBy: req.user.id }) });
+  }));
+
+  router.post('/api/clients/:id/confirm-closure', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    sendJson(res, 200, { client: db.update('clients', params.id, { closed: true, closureRequested: false }) });
+  }));
+
+  router.post('/api/clients/:id/reject-closure', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    sendJson(res, 200, { client: db.update('clients', params.id, { closureRequested: false }) });
+  }));
+
+  router.post('/api/clients/:id/reopen', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    sendJson(res, 200, { client: db.update('clients', params.id, { closed: false, closureRequested: false }) });
+  }));
+
+  // ---- Заметки/звонки по клиенту (лёгкий журнал контактов, отдельно от задач) ----
+
+  router.post('/api/clients/:id/notes', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.text || !body.text.trim()) return sendJson(res, 400, { error: 'Пустая заметка' });
+    const note = { id: Date.now() + '_' + Math.random().toString(36).slice(2, 6), text: body.text.trim(), authorId: req.user.id, createdAt: new Date().toISOString() };
+    const contactNotes = [note, ...(client.contactNotes || [])];
+    sendJson(res, 201, { client: db.update('clients', params.id, { contactNotes }) });
+  }));
+
+  router.delete('/api/clients/:id/notes/:noteId', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    const contactNotes = (client.contactNotes || []).filter((n) => n.id !== params.noteId);
+    sendJson(res, 200, { client: db.update('clients', params.id, { contactNotes }) });
+  }));
+
+  // ---- Мастера точки (сотрудники салона/кабинета/массажной и т.п.) ----
+  // Добавляются сразу (без обязательного подтверждения) — супервайзер видит
+  // непросмотренные через isNew/newMastersCount на дашборде.
+
+  router.post('/api/clients/:id/masters', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.name || !body.name.trim()) return sendJson(res, 400, { error: 'Укажите ФИО мастера' });
+    const master = {
+      id: Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      name: body.name.trim(),
+      phone: body.phone || '',
+      specialization: body.specialization || '',
+      isNew: !isStaff(req.user),
+      createdBy: req.user.id,
+      createdAt: new Date().toISOString()
+    };
+    const masters = [...(client.masters || []), master];
+    sendJson(res, 201, { client: db.update('clients', params.id, { masters }) });
+  }));
+
+  // ---- Доп. контакты клиента (09.10.2026, восстановлено): ЛПР, администратор,
+  // бухгалтер и т.п. Телефоны участвуют в привязке WhatsApp и в поиске по номеру.
+  router.post('/api/clients/:id/contacts', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const name = String(body.name || '').trim();
+    const phone = String(body.phone || '').trim();
+    if (!name && !phone) return sendJson(res, 400, { error: 'Укажите имя или телефон' });
+    const contact = {
+      id: Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      name: name || phone,
+      role: String(body.role || '').trim(),
+      phone,
+      createdBy: req.user.id,
+      createdAt: new Date().toISOString()
+    };
+    sendJson(res, 201, { client: db.update('clients', params.id, { extraContacts: [...(client.extraContacts || []), contact] }) });
+  }));
+
+  router.delete('/api/clients/:id/contacts/:contactId', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const extraContacts = (client.extraContacts || []).filter((x) => x.id !== params.contactId);
+    sendJson(res, 200, { client: db.update('clients', params.id, { extraContacts }) });
+  }));
+
+  router.put('/api/clients/:id/masters/:masterId', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const masters = (client.masters || []).map((m) => {
+      if (m.id !== params.masterId) return m;
+      return {
+        ...m,
+        name: body.name !== undefined ? body.name : m.name,
+        phone: body.phone !== undefined ? body.phone : m.phone,
+        specialization: body.specialization !== undefined ? body.specialization : m.specialization
+      };
+    });
+    sendJson(res, 200, { client: db.update('clients', params.id, { masters }) });
+  }));
+
+  router.post('/api/clients/:id/masters/:masterId/mark-reviewed', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    const masters = (client.masters || []).map((m) => (m.id === params.masterId ? { ...m, isNew: false } : m));
+    sendJson(res, 200, { client: db.update('clients', params.id, { masters }) });
+  }));
+
+  router.delete('/api/clients/:id/masters/:masterId', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    const masters = (client.masters || []).filter((m) => m.id !== params.masterId);
+    sendJson(res, 200, { client: db.update('clients', params.id, { masters }) });
+  }));
+
+  // История визитов по клиенту = его задачи, отсортированные по дате
+  router.get('/api/clients/:id/history', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) {
+      return sendJson(res, 403, { error: 'Недостаточно прав' });
+    }
+    const tasks = db.all('tasks')
+      .filter((t) => t.clientId === client.id)
+      .sort((a, b) => (b.updatedAt || b.createdAt).localeCompare(a.updatedAt || a.createdAt));
+    sendJson(res, 200, { tasks });
+  }));
+
+  // ---- Задачи (воронка визитов) ----
+
+  router.get('/api/tasks', requireAuth(async (req, res) => {
+    sendJson(res, 200, {
+      tasks: scoped(db.all('tasks'), req.user, 'assigneeId'),
+      stages: isStaff(req.user) ? TASK_STAGES : TASK_STAGES.filter((s) => !STAFF_ONLY_STAGES.includes(s.key)),
+      waitlistStages: isStaff(req.user) ? WAITLIST_STAGES : WAITLIST_STAGES.filter((s) => !WAITLIST_STAFF_ONLY_STAGES.includes(s.key)),
+      waitlistTags: WAITLIST_TAGS,
+      saleTags: SALE_TAGS
+    });
+  }));
+
+  // Массовое удаление задач (админ/супервайзер)
+  router.post('/api/tasks/bulk-delete', requireStaff(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const ids = Array.isArray(body.ids) ? body.ids.map(Number) : [];
+    let removed = 0;
+    ids.forEach((id) => {
+      const task = db.find('tasks', id);
+      if (!task) return;
+      (task.attachments || []).forEach((a) => {
+        try { fs.unlinkSync(path.join(UPLOADS_DIR, String(task.id), a.storedName)); } catch (e) {}
+      });
+      if (db.remove('tasks', id)) removed++;
+    });
+    sendJson(res, 200, { removed });
+  }));
+
+  router.post('/api/tasks', requireAuth(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.dueDate) return sendJson(res, 400, { error: 'Укажите срок (дату) задачи' });
+    // П.6 бэклога (08.09.2026): отдельная воронка "Задачи агенту" — задача без
+    // привязки к клиенту (clientId остаётся null). Раньше clientId был обязателен
+    // для ЛЮБОЙ задачи — для этого нового типа проверка явно пропускается, для
+    // всех остальных (visit/sale/waitlist) остаётся как была.
+    const taskType = body.taskType === 'sale' ? 'sale' : (body.taskType === 'waitlist' ? 'waitlist' : (body.taskType === 'agent' ? 'agent' : 'visit'));
+    let client = null;
+    if (taskType !== 'agent') {
+      if (!body.clientId) return sendJson(res, 400, { error: 'Укажите клиента' });
+      client = db.find('clients', body.clientId);
+      if (!client) return sendJson(res, 400, { error: 'Клиент не найден' });
+      if (req.user.role === 'agent' && client.ownerId !== req.user.id) {
+        return sendJson(res, 403, { error: 'Это не ваш клиент' });
+      }
+    }
+    const assigneeId = isStaff(req.user) && body.assigneeId ? Number(body.assigneeId) : (req.user.role === 'agent' ? req.user.id : (client ? client.ownerId : null));
+    if (!assigneeId) return sendJson(res, 400, { error: 'Укажите агента' });
+    const allowedTagsForType = taskType === 'waitlist' ? WAITLIST_TAGS : (taskType === 'sale' ? SALE_TAGS : (taskType === 'agent' ? [] : TASK_TAGS));
+    const tags = Array.isArray(body.tags) ? body.tags.filter((t) => allowedTagsForType.includes(t)) : [];
+    // С Фазы 22 'sale' — односложная задача без собственных этапов (см. комментарий
+    // у SALE_TAGS выше): создаётся сразу в "in_progress", как и визит, только с
+    // другим заголовком по умолчанию и своим набором тегов (бренды + "Договор").
+    const task = db.insert('tasks', {
+      clientId: client ? client.id : null,
+      taskType,
+      title: body.title || (taskType === 'sale' ? `Продажа: ${client.name}` : taskType === 'waitlist' ? `Ожидание товара: ${client.name}` : taskType === 'agent' ? 'Задача агенту' : `Посетить: ${client.name}`),
+      description: body.description || '',
+      dueDate: body.dueDate,
+      visitTime: taskType === 'visit' ? (body.visitTime || '') : '',
+      // П.3 бэклога (08.09.2026): время визита — диапазон «от–до», а не одно
+      // значение. visitTime — «от» (поле сохранено под старым именем ради
+      // совместимости со старыми резервными выгрузками), visitTimeTo — «до».
+      visitTimeTo: taskType === 'visit' ? (body.visitTimeTo || '') : '',
+      stage: taskType === 'waitlist' ? 'waiting' : 'in_progress',
+      tags,
+      comment: '',
+      report: '',
+      dateChangeRequest: null,
+      attachments: [],
+      assigneeId,
+      createdBy: req.user.id,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+    sendJson(res, 201, { task });
+  }));
+
+  router.put('/api/tasks/:id', requireAuth(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && task.assigneeId !== req.user.id) {
+      return sendJson(res, 403, { error: 'Недостаточно прав' });
+    }
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+
+    // Дату задачи после того, как она уже установлена, может менять только
+    // администратор/супервайзер — агент задаёт её только один раз (при создании
+    // или пока поле ещё пустое).
+    // 14.10.2026: исключение — «Лист ожидания»: срок поставки товара агент переносит сам, без заявки.
+    if (body.dueDate !== undefined && body.dueDate !== task.dueDate && task.dueDate && !isStaff(req.user) && task.taskType !== 'waitlist') {
+      return sendJson(res, 403, { error: 'Дату может изменить только администратор или супервайзер. Обратитесь к супервайзеру.' });
+    }
+
+    const patch = { updatedAt: new Date().toISOString() };
+    ['title', 'description', 'dueDate', 'visitTime', 'visitTimeTo', 'comment', 'report'].forEach((f) => {
+      if (body[f] !== undefined) patch[f] = body[f];
+    });
+
+    // П.4 бэклога (08.09.2026): смена воронки (taskType) у уже созданной задачи —
+    // раньше это можно было указать только при создании, если ошиблись при
+    // выборе воронки — приходилось удалять и создавать заново. С Фазы 24
+    // (09.09.2026, по прямой просьбе пользователя — «без запроса каждому
+    // агенту») доступно любому, у кого вообще есть право редактировать эту
+    // задачу (проверено выше, в начале хендлера: сам агент — только свою
+    // задачу, админ/супервайзер — любую) — раньше было доступно только
+    // администратору/супервайзеру, что на практике означало, что агент был
+    // вынужден просить их сменить воронку за себя.
+    // Этап и теги, допустимые в старой воронке, могут быть недопустимы в новой
+    // (у 'waitlist' свой набор этапов WAITLIST_STAGES и тегов WAITLIST_TAGS) —
+    // если новые этап/теги не переданы этим же запросом явно, сбрасываем их на
+    // дефолт новой воронки, а не оставляем потенциально невалидное значение.
+    let effectiveTaskType = task.taskType;
+    if (body.taskType !== undefined) {
+      const newType = body.taskType === 'sale' ? 'sale' : (body.taskType === 'waitlist' ? 'waitlist' : 'visit');
+      if (newType !== task.taskType) {
+        patch.taskType = newType;
+        effectiveTaskType = newType;
+        if (body.stage === undefined) patch.stage = newType === 'waitlist' ? 'waiting' : 'in_progress';
+        if (body.tags === undefined) patch.tags = [];
+      }
+    }
+
+    const isWaitlist = effectiveTaskType === 'waitlist';
+    // С Фазы 22 'sale' по тегам и этапам ведёт себя как обычная задача (visit) —
+    // своя ветка тегов осталась только у 'waitlist'.
+    if (body.tags !== undefined) {
+      const allowedTags = isWaitlist ? WAITLIST_TAGS : (effectiveTaskType === 'sale' ? SALE_TAGS : (effectiveTaskType === 'agent' ? [] : TASK_TAGS));
+      patch.tags = Array.isArray(body.tags) ? body.tags.filter((t) => allowedTags.includes(t)) : [];
+    }
+    if (body.stage !== undefined) {
+      if (isWaitlist) {
+        if (WAITLIST_STAGES.some((s) => s.key === body.stage)) {
+          // "Товар получен клиентом" (закрытая) — подтверждает только админ/супервайзер, как «Архив» у визитов.
+          if (WAITLIST_STAFF_ONLY_STAGES.includes(body.stage) && !isStaff(req.user)) {
+            return sendJson(res, 403, { error: 'Подтвердить получение товара клиентом может только администратор или супервайзер' });
+          }
+          patch.stage = body.stage;
+        }
+      } else if (TASK_STAGES.some((s) => s.key === body.stage)) {
+        // "Архив" — только админ/супервайзер подтверждают выполненную задачу и переносят туда сами.
+        if (STAFF_ONLY_STAGES.includes(body.stage) && !isStaff(req.user)) {
+          return sendJson(res, 403, { error: 'Перевести задачу в архив может только администратор или супервайзер' });
+        }
+        patch.stage = body.stage;
+      }
+    }
+
+    const finalStage = patch.stage !== undefined ? patch.stage : task.stage;
+    const finalReport = patch.report !== undefined ? patch.report : task.report;
+
+    // Нельзя перевести задачу в "Выполнена" без заполненного отчёта — с Фазы 22
+    // действует и для 'sale' тоже (раньше у неё было отдельное обязательное
+    // "пояснение" перед закрытием в "Сделка"/"Провал"; своих этапов больше нет,
+    // так что действует общее правило отчёта, как у визита/листа ожидания).
+    if (!isWaitlist && effectiveTaskType !== 'checkin' && finalStage === 'done' && !String(finalReport || '').trim()) {
+      return sendJson(res, 400, { error: 'Заполните отчёт по задаче — без него нельзя перевести в «Выполнена»' });
+    }
+
+    if (isStaff(req.user)) {
+      if (body.assigneeId !== undefined) patch.assigneeId = Number(body.assigneeId);
+      if (body.clientId !== undefined) patch.clientId = Number(body.clientId);
+    }
+
+    const wasDone = task.stage === 'done';
+    const updated = db.update('tasks', params.id, patch);
+
+    // При первом переводе в "Выполнена" — если у клиента есть день визита, сразу
+    // планируем следующий визит на ближайшую подходящую дату (чтобы агент не забыл).
+    // Защита от дублей: только если у клиента ещё нет другой активной задачи в будущем.
+    if (finalStage === 'done' && !wasDone && effectiveTaskType !== 'checkin') {
+      const client = db.find('clients', updated.clientId);
+      if (client && client.visitDay) {
+        const today = new Date().toISOString().slice(0, 10);
+        const hasFutureActive = db.all('tasks').some((t) =>
+          t.clientId === client.id && t.id !== updated.id && ACTIVE_STAGES.includes(t.stage) && t.dueDate > today
+        );
+        if (!hasFutureActive) {
+          const nextDate = nextDateForWeekday(client.visitDay);
+          if (nextDate) {
+            db.insert('tasks', {
+              clientId: client.id,
+              taskType: 'visit',
+              title: `Посетить: ${client.name}`,
+              description: '',
+              dueDate: nextDate,
+              stage: 'in_progress',
+              tags: [],
+              comment: '',
+              report: '',
+              explanation: '',
+              dateChangeRequest: null,
+              attachments: [],
+              assigneeId: updated.assigneeId,
+              createdBy: req.user.id,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            });
+          }
+        }
+      }
+    }
+
+    // Несостоявшаяся продажа — автоматически выгружаем строку в Google Таблицу
+    // (для анализа ситуации), без блокировки ответа пользователю. С Фазы 22 у
+    // 'sale' нет отдельного этапа "Провал" — ближайший аналог в общей схеме
+    // TASK_STAGES это "Не выполнена" (not_done); в качестве пояснения берём отчёт
+    // по задаче (report), который теперь обязателен при закрытии.
+    if (task.taskType === 'sale' && finalStage === 'not_done' && task.stage !== 'not_done') {
+      const client = db.find('clients', updated.clientId);
+      const agent = db.find('users', updated.assigneeId);
+      googleSheets.appendRow([
+        new Date().toISOString(),
+        client ? client.name : '',
+        agent ? agent.name : '',
+        updated.title,
+        updated.report || '',
+        updated.dueDate || ''
+      ]).catch(() => {});
+    }
+
+    sendJson(res, 200, { task: updated });
+  }));
+
+  // ---- Заявка на перенос даты задачи (агент просит — админ/супервайзер решает) ----
+
+  router.post('/api/tasks/:id/request-date-change', requireAuth(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && task.assigneeId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.requestedDate) return sendJson(res, 400, { error: 'Укажите желаемую дату' });
+    const dateChangeRequest = {
+      requestedDate: body.requestedDate,
+      reason: body.reason || '',
+      requestedBy: req.user.id,
+      createdAt: new Date().toISOString()
+    };
+    sendJson(res, 200, { task: db.update('tasks', params.id, { dateChangeRequest, updatedAt: new Date().toISOString() }) });
+  }));
+
+  router.post('/api/tasks/:id/approve-date-change', requireStaff(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!task.dateChangeRequest) return sendJson(res, 400, { error: 'Нет заявки на перенос' });
+    sendJson(res, 200, {
+      task: db.update('tasks', params.id, {
+        dueDate: task.dateChangeRequest.requestedDate,
+        dateChangeRequest: null,
+        updatedAt: new Date().toISOString()
+      })
+    });
+  }));
+
+  router.post('/api/tasks/:id/reject-date-change', requireStaff(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    sendJson(res, 200, { task: db.update('tasks', params.id, { dateChangeRequest: null, updatedAt: new Date().toISOString() }) });
+  }));
+
+  // ---- Записи встреч (аудио + пояснение), привязаны к клиенту и к конкретной задаче ----
+  //
+  // Фаза 22 (08.09.2026): интерфейс больше не показывает эту секцию у задач
+  // "Продажа" (упрощена в обычную задачу без обязательной аудиозаписи встречи
+  // перед закрытием) — эндпоинт оставлен нетронутым (не вызывается фронтендом),
+  // чтобы не терять уже сохранённые записи у существующих клиентов и на случай,
+  // если функцию решат вернуть.
+  router.post('/api/tasks/:id/meeting-record', requireAuth(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && task.assigneeId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const client = db.find('clients', task.clientId);
+    if (!client) return sendJson(res, 400, { error: 'Клиент не найден' });
+    let parsed;
+    try {
+      parsed = await parseMultipart(req, 20 * 1024 * 1024);
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+    const audioFile = parsed.files.find((f) => /^audio\//.test(f.mimeType));
+    if (!audioFile) return sendJson(res, 400, { error: 'Нужен аудиофайл записи встречи' });
+    const explanation = (parsed.fields && parsed.fields.explanation) || '';
+
+    const meetingsDir = path.join(UPLOADS_DIR, 'meetings', String(client.id));
+    fs.mkdirSync(meetingsDir, { recursive: true });
+    const storedName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${audioFile.filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    fs.writeFileSync(path.join(meetingsDir, storedName), audioFile.data);
+
+    const record = {
+      id: Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      taskId: task.id,
+      explanation,
+      audioUrl: `/uploads/meetings/${client.id}/${storedName}`,
+      authorId: req.user.id,
+      createdAt: new Date().toISOString()
+    };
+    const meetingRecords = [record, ...(client.meetingRecords || [])];
+    db.update('clients', client.id, { meetingRecords });
+    // Пояснение можно сохранить сразу и в самой задаче — удобно видеть в карточке без перехода к клиенту.
+    if (explanation && !task.explanation) db.update('tasks', task.id, { explanation });
+    sendJson(res, 201, { client: db.find('clients', client.id) });
+  }));
+
+  router.delete('/api/tasks/:id', requireStaff(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    (task.attachments || []).forEach((a) => {
+      try { fs.unlinkSync(path.join(UPLOADS_DIR, String(task.id), a.storedName)); } catch (e) {}
+    });
+    db.remove('tasks', params.id);
+    sendJson(res, 200, { ok: true });
+  }));
+
+  // ---- Вложения к задаче (скриншоты, аудио) ----
+
+  router.post('/api/tasks/:id/attachments', requireAuth(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && task.assigneeId !== req.user.id) {
+      return sendJson(res, 403, { error: 'Недостаточно прав' });
+    }
+    let parsed;
+    try {
+      parsed = await parseMultipart(req, 20 * 1024 * 1024); // до 20 МБ на запрос
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+    if (!parsed.files.length) return sendJson(res, 400, { error: 'Файл не найден в запросе' });
+
+    const taskDir = path.join(UPLOADS_DIR, String(task.id));
+    fs.mkdirSync(taskDir, { recursive: true });
+
+    const added = [];
+    for (const file of parsed.files) {
+      // 05.10.2026: некоторые телефоны присылают файл без типа (application/octet-stream) —
+      // определяем по расширению; запись голоса из браузера бывает audio/webm, audio/mp4.
+      if (!/^(image|audio)\//.test(file.mimeType)) {
+        const ext = (file.filename.split('.').pop() || '').toLowerCase();
+        const byExt = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif',
+          mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', opus: 'audio/ogg', oga: 'audio/ogg', wav: 'audio/wav', webm: 'audio/webm', weba: 'audio/webm', amr: 'audio/amr', '3gp': 'audio/3gpp' };
+        if (byExt[ext]) file.mimeType = byExt[ext];
+      }
+      const allowed = /^image\//.test(file.mimeType) || /^audio\//.test(file.mimeType);
+      if (!allowed) continue; // разрешены только изображения и аудио
+      const storedName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      fs.writeFileSync(path.join(taskDir, storedName), file.data);
+      added.push({
+        id: storedName,
+        filename: file.filename,
+        mimeType: file.mimeType,
+        size: file.data.length,
+        storedName,
+        url: `/uploads/${task.id}/${storedName}`
+      });
+    }
+    if (!added.length) return sendJson(res, 400, { error: 'Разрешены только изображения и аудиофайлы' });
+
+    const attachments = [...(task.attachments || []), ...added];
+    const updated = db.update('tasks', task.id, { attachments, updatedAt: new Date().toISOString() });
+    sendJson(res, 201, { task: updated });
+  }));
+
+  router.delete('/api/tasks/:id/attachments/:attId', requireAuth(async (req, res, params) => {
+    const task = db.find('tasks', params.id);
+    if (!task) return sendJson(res, 404, { error: 'Не найдено' });
+    if (!isStaff(req.user) && task.assigneeId !== req.user.id) {
+      return sendJson(res, 403, { error: 'Недостаточно прав' });
+    }
+    const att = (task.attachments || []).find((a) => a.id === params.attId);
+    if (att) {
+      try { fs.unlinkSync(path.join(UPLOADS_DIR, String(task.id), att.storedName)); } catch (e) {}
+    }
+    const attachments = (task.attachments || []).filter((a) => a.id !== params.attId);
+    const updated = db.update('tasks', task.id, { attachments, updatedAt: new Date().toISOString() });
+    sendJson(res, 200, { task: updated });
+  }));
+
+  // ---- Встречи супервайзера с клиентом (отдельно от задач агентов) ----
+  // Видны в календаре: агентам — чтобы видеть, какие дни у клиента уже заняты
+  // визитом супервайзера; у самого супервайзера — отдельным разделом с
+  // возможностью добавить/удалить. Не привязаны к воронке задач намеренно —
+  // это просто бронь дня/времени, без этапов и отчётов.
+  router.get('/api/supervisor-meetings', requireAuth(async (req, res) => {
+    let meetings = db.all('supervisorMeetings');
+    if (req.user.role === 'agent') {
+      const myClientIds = new Set(db.all('clients').filter((c) => c.ownerId === req.user.id).map((c) => c.id));
+      meetings = meetings.filter((m) => myClientIds.has(m.clientId));
+    }
+    sendJson(res, 200, { meetings });
+  }));
+
+  router.post('/api/supervisor-meetings', requireStaff(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body.clientId) return sendJson(res, 400, { error: 'Укажите клиента' });
+    if (!body.date) return sendJson(res, 400, { error: 'Укажите дату встречи' });
+    const client = db.find('clients', body.clientId);
+    if (!client) return sendJson(res, 400, { error: 'Клиент не найден' });
+    const meeting = db.insert('supervisorMeetings', {
+      clientId: Number(body.clientId),
+      date: body.date,
+      time: body.time || '',
+      note: body.note || '',
+      createdBy: req.user.id,
+      createdAt: new Date().toISOString()
+    });
+    sendJson(res, 201, { meeting });
+  }));
+
+  router.delete('/api/supervisor-meetings/:id', requireStaff(async (req, res, params) => {
+    const meeting = db.find('supervisorMeetings', params.id);
+    if (!meeting) return sendJson(res, 404, { error: 'Не найдено' });
+    db.remove('supervisorMeetings', params.id);
+    sendJson(res, 200, { ok: true });
+  }));
+
+  // Экспорт проваленных задач воронки продажи в CSV (работает уже сейчас, без
+  // настройки Google Таблицы — можно скачать и залить на Диск вручную).
+  router.get('/api/tasks/failed-export', requireStaff(async (req, res) => {
+    // С Фазы 22 у 'sale' нет отдельного этапа "Провал" — берём задачи типа "Продажа"
+    // в этапе "Не выполнена" (not_done), это ближайший аналог в общей схеме TASK_STAGES.
+    const failed = db.all('tasks').filter((t) => t.taskType === 'sale' && t.stage === 'not_done');
+    const rows = [['Дата', 'Клиент', 'Агент', 'Задача', 'Отчёт', 'Срок']];
+    failed.forEach((t) => {
+      const client = db.find('clients', t.clientId);
+      const agent = db.find('users', t.assigneeId);
+      rows.push([t.updatedAt || t.createdAt, client ? client.name : '', agent ? agent.name : '', t.title, t.report || '', t.dueDate || '']);
+    });
+    const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+    const buf = Buffer.from('﻿' + csv, 'utf8'); // BOM — чтобы Excel корректно показал кириллицу
+    res.writeHead(200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="provaly-${new Date().toISOString().slice(0, 10)}.csv"`,
+      'Content-Length': buf.length
+    });
+    res.end(buf);
+  }));
+
+  // Полная выгрузка задач в файл (JSON) — на случай пересборки/передеплоя проекта,
+  // когда data/db.json не переносится и все задачи "теряются" (правка от 31.08.2026).
+  // Экспортируем задачи вместе с человекочитаемыми ключами (имя клиента, имя
+  // ответственного агента, имя постановщика) — специально НЕ полагаемся на числовые
+  // id, потому что после пересборки клиенты/пользователи создаются заново импортом
+  // и их id могут не совпасть с прежними. Вложения (файлы) в выгрузку не входят —
+  // сами файлы на диске всё равно теряются при пересборке, в файл идёт только
+  // текстовая часть задачи.
+  router.get('/api/tasks/export', requireStaff(async (req, res) => {
+    const clientsById = {};
+    db.all('clients').forEach((c) => { clientsById[c.id] = c; });
+    const usersById = {};
+    db.all('users').forEach((u) => { usersById[u.id] = u; });
+    // Задачи «Посещение» (Фаза 40) выгружаются вместе с остальными — с 28.09.2026
+    // они создаются кнопкой, а не автоматически, поэтому должны переживать деплой
+    // (жалоба пользователя «задачи по посещению не перенеслись с выгрузкой»).
+    const tasks = db.all('tasks').map((t) => {
+      const client = clientsById[t.clientId];
+      const assignee = usersById[t.assigneeId];
+      const creator = usersById[t.createdBy];
+      return {
+        clientName: client ? client.name : null,
+        agentName: assignee ? assignee.name : null,
+        createdByName: creator ? creator.name : null,
+        taskType: t.taskType,
+        title: t.title,
+        description: t.description || '',
+        dueDate: t.dueDate,
+        visitTime: t.visitTime || '',
+        visitTimeTo: t.visitTimeTo || '',
+        checkinAt: t.checkinAt || null,
+        lateCheckin: !!t.lateCheckin,
+        stage: t.stage,
+        tags: t.tags || [],
+        comment: t.comment || '',
+        report: t.report || '',
+        explanation: t.explanation || '',
+        createdAt: t.createdAt,
+        updatedAt: t.updatedAt
+      };
+    });
+    const buf = Buffer.from(JSON.stringify({ exportedAt: new Date().toISOString(), tasks }, null, 2), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': `attachment; filename="zadachi-${new Date().toISOString().slice(0, 10)}.json"`,
+      'Content-Length': buf.length
+    });
+    res.end(buf);
+  }));
+
+  // Выгрузка клиентов в файл (Фаза 16, добавлено 01.09.2026, заменило собой
+  // прежнюю кнопку "Выгрузить только задачи" на странице "Команда" — она осталась
+  // на вкладке "Задачи", здесь была лишней). Назначение: при пересборке проекта
+  // (новый месяц данных, новый zip) db.json не переносится — контрагенты
+  // создаются заново импортом из исходных файлов с Google Диска, а значит все
+  // ручные правки (адрес/телефон/контактное лицо/номер маршрута/договор/форма
+  // оплаты/заметки/мастера и т.п.), сделанные командой прямо в CRM, потерялись
+  // бы. Этот файл — снимок текущего состояния клиентов ИМЕННО по этим ручным
+  // полям (не выгружаем то, что и так пересчитывается заново из файлов продаж/
+  // долгов при каждой пересборке: ассортимент, долг, продажи текущего месяца,
+  // "постоянный клиент" и т.п.) — при следующей пересборке этот файл можно
+  // использовать, чтобы перенести правки в новую базу вместо того, чтобы
+  // опираться только на исходные экспорты маршрутов из Excel. Агент указан по
+  // имени (не по id) — та же причина, что и у /api/tasks/export: id после
+  // пересборки не гарантированно совпадут.
+  // ---- Отметка посещения (Фаза 40, 25.09.2026) ----
+  // Агент у точки жмёт «📍 Отметить посещение»: браузер отдаёт координаты,
+  // сервер ставит СВОЁ время. Первая отметка с нормальной точностью GPS
+  // запоминает координаты точки (client.geo); следующие сравниваются с ними —
+  // ближе VISIT_RADIUS_M = «у точки», дальше = «далеко». Всё хранится в
+  // карточке клиента (client.visits) и выгружается вместе с клиентами.
+  // Создание задач «Посещение» кнопкой (Фаза 40, правка 28.09.2026).
+  // Админ/супервайзер — на выбранного агента или на всех; агент — только себе.
+  router.post('/api/tasks/checkin-generate', requireAuth(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    // 29.09.2026: период dateFrom–dateTo (до 31 дня); старый параметр date — один день.
+    const isDate = (x) => /^\d{4}-\d{2}-\d{2}$/.test(x || '');
+    const dateFrom = isDate(body.dateFrom) ? body.dateFrom : (isDate(body.date) ? body.date : bishkekToday());
+    const dateTo = isDate(body.dateTo) && body.dateTo >= dateFrom ? body.dateTo : dateFrom;
+    let agentId = body.agentId ? Number(body.agentId) : null;
+    if (!isStaff(req.user)) agentId = req.user.id;
+    let created = 0, skipped = 0, days = 0;
+    for (let d = new Date(dateFrom + 'T00:00:00Z'); d.toISOString().slice(0, 10) <= dateTo && days < 31; d.setUTCDate(d.getUTCDate() + 1)) {
+      const r = createCheckinTasks(d.toISOString().slice(0, 10), agentId, req.user.id);
+      created += r.created; skipped += r.skipped; days++;
+    }
+    sendJson(res, 200, { dateFrom, dateTo, days, created, skipped });
+  }));
+
+  router.post('/api/clients/:id/visit', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    if (!isStaff(req.user) && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Это не ваш клиент' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const lat = Number(body.lat);
+    const lng = Number(body.lng);
+    const hasGps = Number.isFinite(lat) && Number.isFinite(lng) && !(lat === 0 && lng === 0);
+    const accuracy = Number.isFinite(Number(body.accuracy)) ? Math.round(Number(body.accuracy)) : null;
+    const now = new Date();
+    const visits = client.visits || [];
+    const recent = visits.slice().reverse().find((v) => v.agentId === req.user.id && !VISIT_NOT_COUNTED.includes(v.status));
+    if (recent && now - new Date(recent.at) < VISIT_REPEAT_MIN * 60 * 1000) {
+      return sendJson(res, 429, { error: `Посещение уже отмечено в ${new Date(recent.at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bishkek' })}` });
+    }
+    let status = 'nogps';
+    let distance = null;
+    let geo = client.geo || null;
+    if (hasGps) {
+      if (geo) {
+        distance = Math.round(haversineM(lat, lng, geo.lat, geo.lng));
+        status = distance <= effVisitRadius(client) ? 'near' : 'far';
+      } else if (accuracy === null || accuracy <= VISIT_FIRST_MAX_ACCURACY_M) {
+        geo = { lat, lng, accuracy, setAt: now.toISOString(), setBy: req.user.name };
+        status = 'first';
+      } else {
+        status = 'lowacc';
+      }
+    }
+    const visit = {
+      id: `${now.getTime()}_${req.user.id}`,
+      at: now.toISOString(),
+      agentId: req.user.id,
+      agentName: req.user.name,
+      lat: hasGps ? lat : null,
+      lng: hasGps ? lng : null,
+      accuracy,
+      distance,
+      status,
+      comment: (body.comment || '').toString().slice(0, 300)
+    };
+    // 19.10.2026: отметка с GPS — заодно точка трека агента.
+    if (hasGps) { try { geoTrack.addPing(req.user.id, lat, lng, accuracy); } catch (e) { /* не критично */ } }
+    const updated = db.update('clients', client.id, { geo, visits: [...visits, visit].slice(-VISITS_KEEP) });
+    // Закрываем задачу «Посещение» на сегодня по этому клиенту (Фаза 40).
+    const today = bishkekDate(now);
+    const late = bishkekNow().getUTCHours() >= TASK_DEADLINE_HOUR;
+    const task = db.all('tasks').find((t) => t.taskType === 'checkin' && t.clientId === client.id && t.dueDate <= today && isActiveStage(t)
+      && t.assigneeId === req.user.id);
+    let closedTask = null;
+    // Без GPS отметка сохраняется в журнал (видна супервайзеру), но задачу
+    // «Посещение» НЕ закрывает (правка пользователя 25.09.2026).
+    if (task && status !== 'nogps') {
+      closedTask = db.update('tasks', task.id, { stage: 'done', report: checkinReport(visit), checkinAt: visit.at, lateCheckin: late || task.dueDate < today, updatedAt: now.toISOString() });
+    }
+    sendJson(res, 201, { visit, task: closedTask, client: withFreshCurrentMonth([updated])[0] });
+  }));
+
+  // Сброс координат точки (админ/супервайзер) — если первую отметку сделали не у точки.
+  router.delete('/api/clients/:id/geo', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    // Правка 28.09.2026 («при обнулении координат задача не возвращается в
+    // «Ждёт отметки»»): отметка, которой были сохранены сброшенные координаты,
+    // считается ошибочной — помечается 'reset' (остаётся в журнале/отчёте, но
+    // не засчитывается), а закрытые ею задачи «Посещение» возвращаются в
+    // «Ждёт отметки», чтобы агент отметился у точки заново.
+    const geo = client.geo;
+    let reopened = 0;
+    let visits = client.visits || [];
+    if (geo) {
+      const badAt = geo.setAt;
+      visits = visits.map((v) => (v.at === badAt && v.status === 'first' ? { ...v, status: 'reset', resetAt: new Date().toISOString(), resetBy: req.user.name } : v));
+      db.all('tasks').filter((t) => t.taskType === 'checkin' && t.clientId === client.id && t.checkinAt === badAt && t.stage === 'done').forEach((t) => {
+        db.update('tasks', t.id, { stage: 'in_progress', report: '', checkinAt: null, lateCheckin: false, updatedAt: new Date().toISOString() });
+        reopened++;
+      });
+    }
+    const updated = db.update('clients', client.id, { geo: null, visits });
+    sendJson(res, 200, { client: withFreshCurrentMonth([updated])[0], reopened });
+  }));
+
+  // Отчёт супервайзера «Посещения»: from/to (YYYY-MM-DD, по времени Бишкека), agentId.
+  // 15.10.2026: отчёт «WhatsApp: переписка с точками» — сколько точек в группе
+  // (агент / день визита = маршрут дня / тип точки), у скольких есть номер,
+  // скольким написали за период, сколько ответили. Считается по сообщениям,
+  // которые CRM уже получила с подключённых номеров (до подключения номера
+  // переписки в CRM нет).
+  router.get('/api/reports/whatsapp', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const today = bishkekDate(new Date());
+    const from = u.searchParams.get('from') || today.slice(0, 8) + '01';
+    const to = u.searchParams.get('to') || today;
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    const usersById = {};
+    db.all('users').forEach((x) => { usersById[x.id] = x; });
+    const rows = [];
+    db.all('clients').forEach((c) => {
+      if (c.closed) return;
+      if (agentId && c.ownerId !== agentId) return;
+      const r = whatsapp.messagesForClient(c, null);
+      let out = 0, inc = 0, lastOut = 0, lastIn = 0, firstOut = 0;
+      const writers = new Set();
+      r.messages.forEach((m) => {
+        const d = bishkekDate(new Date(m.t * 1000));
+        if (d < from || d > to) return;
+        if (m.me) { out++; writers.add(m.a); if (m.t > lastOut) lastOut = m.t; if (!firstOut || m.t < firstOut) firstOut = m.t; } else { inc++; if (m.t > lastIn) lastIn = m.t; }
+      });
+      rows.push({
+        clientId: c.id,
+        clientName: c.name,
+        address: c.address || '',
+        ownerId: c.ownerId,
+        ownerName: usersById[c.ownerId] ? usersById[c.ownerId].name : '—',
+        visitDay: c.visitDay || '',
+        pointType: c.pointType || '',
+        routeNumber: c.routeNumber != null ? c.routeNumber : null,
+        hasPhone: r.keys.length > 0,
+        out, inc, lastOut, lastIn, firstOut,
+        writers: [...writers].map((id) => (usersById[id] ? usersById[id].name : String(id)))
+      });
+    });
+    const connected = whatsapp.statusOf ? db.all('users').filter((x) => x.role === 'agent').map((a) => ({ agentId: a.id, agentName: a.name, status: (whatsapp.statusOf(a.id) || {}).status || 'off' })) : [];
+    sendJson(res, 200, { from, to, rows, connected });
+  }));
+
+  // 15.10.2026: «Охват района: посещение / WhatsApp» — см. coverageRows().
+  router.get('/api/reports/coverage', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const from = u.searchParams.get('from') || bishkekDate(new Date());
+    const to = u.searchParams.get('to') || from;
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    // 15.10.2026: охват WhatsApp за весь период (не по дню визита) — по агентам.
+    const waPeriod = {};
+    db.all('clients').forEach((c) => {
+      if (c.closed || (agentId && c.ownerId !== agentId)) return;
+      const x = waPeriod[c.ownerId] || (waPeriod[c.ownerId] = { total: 0, written: 0 });
+      x.total++;
+      const wrote = whatsapp.messagesForClient(c, null).messages.some((m) => m.me && m.a === c.ownerId && (() => { const d = bishkekDate(new Date(m.t * 1000)); return d >= from && d <= to; })());
+      if (wrote) x.written++;
+    });
+    const prow = periodCoverageRows(from, to, agentId);
+    const day = (u.searchParams.get('day') || '').toLowerCase();
+    sendJson(res, 200, { from, to, rows: coverageRows(from, to, agentId, day), waPeriod, periodRows: day ? prow.filter((r) => r.visitDay === day) : prow });
+  }));
+
+  // 15.10.2026: «Клиенты без ответа до 20:00» — см. unansweredRows().
+  router.get('/api/reports/whatsapp-unanswered', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const from = u.searchParams.get('from') || bishkekDate(new Date(Date.now() - 6 * 86400000));
+    const to = u.searchParams.get('to') || bishkekDate(new Date());
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    sendJson(res, 200, { from, to, rows: unansweredRows(from, to, agentId, false) });
+  }));
+
+  // 15.10.2026: недельный отчёт по агентам с баллами (для PDF) — см. weekReport().
+  // 26.10.2026: динамика по дням — продажи (по датам накладных среза) и WhatsApp
+  // (сколько клиентам агент написал и сколько сообщений) для графика в «Отчётах».
+  // ---- ABC и остатки (26.10.2026): см. правила в src/abc.js ----
+  router.get('/api/abc/oos', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    sendJson(res, 200, abc.oosReport({
+      clients: db.all('clients'), agents: db.all('users').filter((x) => x.role === 'agent'),
+      from: u.searchParams.get('from') || '', to: u.searchParams.get('to') || '',
+      partial: u.searchParams.get('partial') === '1',
+      agentId: u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null
+    }));
+  }));
+  router.get('/api/abc', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    sendJson(res, 200, abc.abcReport({
+      clients: db.all('clients'), agents: db.all('users').filter((x) => x.role === 'agent'),
+      months: (u.searchParams.get('months') || '').split(',').filter(Boolean),
+      agentId: u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null,
+      brand: u.searchParams.get('brand') || ''
+    }));
+  }));
+  // Загрузка с сайта: отчёт «Остатки товаров в днях» и прайс-лист для салонов (.xlsx).
+  router.post('/api/abc/upload', requireStaff(async (req, res) => {
+    let parsed;
+    try { parsed = await parseMultipart(req, 15 * 1024 * 1024); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const results = [];
+    for (const file of parsed.files) {
+      if (/\.xls$/i.test(file.filename)) { results.push({ file: file.filename, error: 'Старый формат .xls — откройте файл в Excel и сохраните как .xlsx (или выгрузите из 1С как «Лист Excel 2007»).' }); continue; }
+      let rows;
+      try { rows = parseTableFile(file.filename, file.data); } catch (e) { results.push({ file: file.filename, error: 'Не удалось прочитать: ' + e.message }); continue; }
+      const title = String((rows[0] || []).find((c) => c) || '');
+      try {
+        if (/остатки товаров в днях/i.test(title)) {
+          const snap = stockImport.buildSnapshot(rows);
+          const r = abc.saveSnapshot(snap);
+          const list = Object.values(snap.items);
+          results.push({ file: file.filename, kind: 'stock', date: snap.date, period: `${snap.periodFrom} – ${snap.periodTo}`, items: list.length, zero: list.filter((x) => x.qty <= 0).length, replaced: r.existed });
+        } else if (/прайс/i.test(title) || rows.some((r) => r.some((c) => /^цена/i.test(String(c || '').trim())))) {
+          const map = stockImport.parsePriceRows(rows, file.filename);
+          abc.savePrices(map);
+          results.push({ file: file.filename, kind: 'price', title, items: Object.keys(map).filter((k) => k.startsWith('n:')).length });
+        } else results.push({ file: file.filename, error: 'Не похоже ни на «Остатки товаров в днях», ни на прайс-лист: ' + title.slice(0, 80) });
+      } catch (e) { results.push({ file: file.filename, error: e.message }); }
+    }
+    // Проверка пропусков между снимками.
+    const snaps = abc.loadSnapshots();
+    const gaps = [];
+    for (let i = 1; i < snaps.length; i++) { const d = (new Date(snaps[i].date) - new Date(snaps[i - 1].date)) / 864e5; if (d > 8) gaps.push(`${snaps[i - 1].date} → ${snaps[i].date}`); }
+    sendJson(res, 200, { results, snapshots: snaps.length, gaps });
+  }));
+
+  router.get('/api/reports/daily', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const today = bishkekDate(new Date());
+    const to = u.searchParams.get('to') || today;
+    const from = u.searchParams.get('from') || to.slice(0, 8) + '01';
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    const agents = db.all('users').filter((x) => x.role === 'agent' && (!agentId || x.id === agentId));
+    const ids = new Set(agents.map((a) => a.id));
+    const pd = periodDates(from, to);
+    const blank = () => pd.map((d) => ({ date: d.key, wd: d.wd, sales: 0, invoices: 0, waOut: 0, waIn: 0, waClients: 0, visits: 0, visitClients: 0 }));
+    // 26.10.2026: по каждому агенту отдельно (расшифровка), команда — сумма агентов.
+    const per = new Map(agents.map((a) => [a.id, { agentId: a.id, agentName: a.name, days: blank(), sets: new Map() }]));
+    const dayOf = (agentId, date) => { const p = per.get(agentId); if (!p) return null; const i = pd.findIndex((x) => x.key === date); return i < 0 ? null : p.days[i]; };
+    const addSet = (agentId, kind, date, cid) => { const p = per.get(agentId); const k = kind + '|' + date; const st = p.sets.get(k) || new Set(); st.add(cid); p.sets.set(k, st); };
+    let salesAsOf = null;
+    agents.forEach((a) => {
+      const f = agentSalesFact(a.name);
+      if (f.asOf && (!salesAsOf || f.asOf > salesAsOf)) salesAsOf = f.asOf;
+      Object.entries(f.byDate || {}).forEach(([d, x]) => { const r = dayOf(a.id, d); if (r) { r.sales += x.sum || 0; r.invoices += x.invoices || 0; } });
+    });
+    db.all('clients').forEach((c) => {
+      // Посещения — отметки у точек (без «без GPS» и сброшенных).
+      (c.visits || []).forEach((v) => {
+        if (!ids.has(v.agentId) || VISIT_NOT_COUNTED.includes(v.status)) return;
+        const d = bishkekDate(new Date(v.at)); const r = dayOf(v.agentId, d);
+        if (!r) return;
+        r.visits++; addSet(v.agentId, 'v', d, c.id);
+      });
+      let msgs = [];
+      try { msgs = whatsapp.messagesForClient(c, null).messages; } catch (e) { return; }
+      msgs.forEach((m) => {
+        if (!ids.has(m.a)) return;
+        const d = bishkekDate(new Date(m.t * 1000)); const r = dayOf(m.a, d);
+        if (!r) return;
+        if (m.me) { r.waOut++; addSet(m.a, 'w', d, c.id); } else r.waIn++;
+      });
+    });
+    const byAgent = [...per.values()].map((p) => {
+      p.days.forEach((d) => { d.visitClients = (p.sets.get('v|' + d.date) || new Set()).size; d.waClients = (p.sets.get('w|' + d.date) || new Set()).size; d.sales = Math.round(d.sales); });
+      return { agentId: p.agentId, agentName: p.agentName, days: p.days };
+    });
+    const days = blank();
+    byAgent.forEach((a) => a.days.forEach((d, i) => ['sales', 'invoices', 'waOut', 'waIn', 'waClients', 'visits', 'visitClients'].forEach((k) => { days[i][k] += d[k]; })));
+    sendJson(res, 200, { from, to, salesAsOf, days, byAgent });
+  }));
+
+  router.get('/api/reports/week', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const from = u.searchParams.get('from');
+    const to = u.searchParams.get('to');
+    if (!from || !to) return sendJson(res, 400, { error: 'Укажите период' });
+    sendJson(res, 200, weekReport(from, to));
+  }));
+
+  // ---- Трекер агентов (19.10.2026) ----
+  // Агент: браузер присылает местоположение, пока открыт сайт (раз в несколько минут).
+  router.post('/api/geo/ping', requireAuth(async (req, res) => {
+    if (req.user.role !== 'agent') return sendJson(res, 200, { saved: false, reason: 'notagent' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    sendJson(res, 200, geoTrack.addPing(req.user.id, body.lat, body.lng, body.accuracy));
+  }));
+
+  // Открытие CRM в браузере (26.10.2026): фиксируем сеанс работы агента и где он был.
+  router.post('/api/activity', requireAuth(async (req, res) => {
+    if (req.user.role !== 'agent') return sendJson(res, 200, { saved: false, reason: 'notagent' });
+    let body = {};
+    try { body = await readBody(req); } catch (e) { /* координаты необязательны */ }
+    sendJson(res, 200, activity.log(req.user.id, body.lat, body.lng, body.accuracy));
+  }));
+  router.get('/api/activity/report', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const today = bishkekDate(new Date());
+    const to = u.searchParams.get('to') || today;
+    const from = u.searchParams.get('from') || to;
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    const fromSec = Math.floor(new Date(from + 'T00:00:00+06:00').getTime() / 1000);
+    const toSec = Math.floor(new Date(to + 'T23:59:59+06:00').getTime() / 1000);
+    const agents = db.all('users').filter((x) => x.role === 'agent' && (!agentId || x.id === agentId));
+    const rows = agents.map((a) => {
+      const ss = activity.sessions(a.id, fromSec, toSec);
+      const days = new Set(ss.map((s) => s.date));
+      return {
+        agentId: a.id, agentName: a.name,
+        sessionsCount: ss.length, daysActive: days.size,
+        totalMin: ss.reduce((x, s) => x + s.durationMin, 0),
+        firstAt: ss.length ? ss[0].start : null, lastAt: ss.length ? ss[ss.length - 1].end : null,
+        sessions: ss
+      };
+    });
+    rows.sort((a, b) => b.sessionsCount - a.sessionsCount || a.agentName.localeCompare(b.agentName, 'ru'));
+    sendJson(res, 200, { from, to, rows });
+  }));
+
+  // Последнее местоположение каждого агента («Где агент?»): пинг или отметка посещения — что свежее.
+  function lastLocationOf(agent) {
+    const p = geoTrack.lastPing(agent.id);
+    let v = null;
+    db.all('clients').forEach((c) => (c.visits || []).forEach((x) => {
+      if (x.agentId === agent.id && x.lat != null && (!v || x.at > v.at)) v = { ...x, clientName: c.name };
+    }));
+    const vt = v ? Math.floor(new Date(v.at).getTime() / 1000) : 0;
+    if (p && p.t >= vt) return { source: 'ping', t: p.t, lat: p.lat, lng: p.lng, acc: p.acc };
+    if (v) return { source: 'visit', t: vt, lat: v.lat, lng: v.lng, acc: v.accuracy || null, clientName: v.clientName };
+    return null;
+  }
+  // Фоновый трекинг (19.10.2026): приложение Traccar Client на телефоне агента
+  // (Android/iOS, бесплатно) работает в фоне и шлёт координаты сюда. Протокол OsmAnd:
+  // параметры в адресе (?id=…&lat=…&lon=…&timestamp=…&accuracy=…) или JSON
+  // { device_id, location: { timestamp, coords: { latitude, longitude, accuracy } } }.
+  // id/device_id = личный «ключ трекера» агента (Команда → 📡 Трекер), без входа на сайт.
+  const trackerAttempts = [];
+  async function osmand(req, res) {
+    const u = new URL(req.url, 'http://x');
+    // 20.10.2026: тело читаем «как есть» — приложение может слать JSON, форму
+    // (id=…&lat=…&lon=…) или массив точек. Форма раньше не читалась («нет ключа»).
+    let raw = '';
+    if (req.method === 'POST') {
+      raw = await new Promise((resolve) => {
+        const chunks = []; let size = 0;
+        req.on('data', (c) => { size += c.length; if (size < 1024 * 1024) chunks.push(c); });
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        req.on('error', () => resolve(''));
+      });
+    }
+    const ctype = String(req.headers['content-type'] || '');
+    let body = {};
+    const form = new URLSearchParams();
+    const t0 = raw.trim();
+    if (t0.startsWith('{') || t0.startsWith('[')) {
+      try { const j = JSON.parse(t0); body = Array.isArray(j) ? { location: j } : (j || {}); } catch (e) { body = {}; }
+    } else if (t0) {
+      try { new URLSearchParams(t0).forEach((v, k) => form.set(k, v)); } catch (e) { /* не форма */ }
+    }
+    const q = (k) => (u.searchParams.get(k) != null ? u.searchParams.get(k) : form.get(k));
+    // Пакетная отправка: location может быть массивом — берём все точки.
+    // Новая версия Traccar Client может слать точку прямо в корне JSON: { coords, timestamp, device_id, … }.
+    const locs = Array.isArray(body.location) ? body.location : [body.location || (body.coords ? body : {})];
+    const loc = locs[locs.length - 1] || {};
+    const coords = loc.coords || {};
+    const id = String(q('id') || q('deviceid') || q('device_id') || body.device_id || body.deviceId || body.id || (body.params && body.params.device_id) || (loc && (loc.device_id || (loc.extras && loc.extras.device_id))) || '').trim();
+    const lat = q('lat') != null ? q('lat') : coords.latitude;
+    const lng = q('lon') != null ? q('lon') : (q('lng') != null ? q('lng') : coords.longitude);
+    const acc = q('accuracy') != null ? q('accuracy') : coords.accuracy;
+    let ts = q('timestamp') != null ? q('timestamp') : loc.timestamp;
+    let atSec = null;
+    if (ts != null && ts !== '') {
+      if (/^\d+(\.\d+)?$/.test(String(ts))) { atSec = Number(ts); if (atSec > 1e12) atSec = atSec / 1000; } else { const d = Date.parse(ts); if (!isNaN(d)) atSec = d / 1000; }
+    }
+    const agent = id ? db.all('users').find((x) => x.role === 'agent' && x.trackerToken && x.trackerToken.toLowerCase() === id.toLowerCase()) : null;
+    const attempt = { at: new Date().toISOString(), method: req.method, id, agentName: agent ? agent.name : null, format: u.searchParams.get('lat') != null ? 'query' : form.get('lat') != null ? 'form' : (body.location ? 'json' : body.coords ? 'json-root' : 'other'), keys: Object.keys(body).slice(0, 8), ctype: ctype.slice(0, 60), sample: raw.slice(0, 300).replace(/[0-9a-f]{10}/gi, (m) => m.slice(0, 4) + '…'), ua: String(req.headers['user-agent'] || '').slice(0, 80) };
+    if (!agent) {
+      attempt.result = id ? 'неизвестный ключ' : 'нет ключа (id)';
+      trackerAttempts.unshift(attempt); trackerAttempts.length = Math.min(trackerAttempts.length, 50);
+      res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('unknown device');
+    }
+    let r = { saved: false, reason: 'nocoords' };
+    if (locs.length > 1) {
+      locs.forEach((l) => {
+        const c = l.coords || {};
+        const tsx = l.timestamp ? Date.parse(l.timestamp) / 1000 : null;
+        const rr = geoTrack.addPing(agent.id, c.latitude, c.longitude, c.accuracy, tsx, 'app');
+        if (rr.saved) r = rr; else if (!r.saved) r = rr;
+      });
+    } else {
+      r = geoTrack.addPing(agent.id, lat, lng, acc, atSec, 'app');
+    }
+    // 22.10.2026: время самой точки (телефон может досылать накопленные старые точки).
+    const lastLoc = locs.length > 1 ? locs[locs.length - 1] : null;
+    const ptSec = lastLoc && lastLoc.timestamp ? Date.parse(lastLoc.timestamp) / 1000 : atSec;
+    if (ptSec && isFinite(ptSec)) attempt.pointAt = new Date(ptSec * 1000).toISOString();
+    attempt.result = r.saved ? 'OK' : ({ offhours: 'вне рабочего времени', often: 'слишком часто', bad: 'нет координат' }[r.reason] || r.reason);
+    trackerAttempts.unshift(attempt); trackerAttempts.length = Math.min(trackerAttempts.length, 50);
+    // Отвечаем 200 даже на «вне рабочего времени»/«слишком часто» — иначе приложение копит и повторяет точки.
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(r.saved ? 'OK' : 'SKIP ' + r.reason);
+  }
+  router.get('/api/geo/osmand', osmand);
+  // Диагностика: последние запросы от приложений (в памяти, до перезапуска сервера).
+  router.get('/api/tracker/attempts', requireStaff(async (req, res) => sendJson(res, 200, { attempts: trackerAttempts })));
+  router.post('/api/geo/osmand', osmand);
+
+  // Ключ трекера агента (админ): посмотреть / создать заново.
+  router.get('/api/users/:id/tracker', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user || user.role !== 'agent') return sendJson(res, 404, { error: 'Агент не найден' });
+    let token = user.trackerToken;
+    if (!token) { token = require('crypto').randomBytes(5).toString('hex'); db.update('users', user.id, { trackerToken: token }); }
+    const last = geoTrack.lastPing(user.id);
+    sendJson(res, 200, { token, last });
+  }));
+  router.post('/api/users/:id/tracker/reset', requireAdmin(async (req, res, params) => {
+    const user = db.find('users', params.id);
+    if (!user || user.role !== 'agent') return sendJson(res, 404, { error: 'Агент не найден' });
+    const token = require('crypto').randomBytes(5).toString('hex');
+    db.update('users', user.id, { trackerToken: token });
+    sendJson(res, 200, { token });
+  }));
+
+  router.get('/api/tracker/where', requireStaff(async (req, res) => {
+    const agents = db.all('users').filter((u) => u.role === 'agent');
+    sendJson(res, 200, { now: Math.floor(Date.now() / 1000), agents: agents.map((a) => ({ agentId: a.id, agentName: a.name, last: lastLocationOf(a) })) });
+  }));
+
+  // Трек за период: пинги, отметки посещений, клиенты агента с координатами.
+  // 23.10.2026: продажи (сумма, сделки) и WhatsApp (сообщения, дни касаний) клиента за период.
+  // Продажи по дням есть только за текущий месяц (срезы агентов).
+  // 23.10.2026 (позже): у отчёта по точке свой период (repFrom–repTo), отдельно от трека.
+  function trackerClientInfo(c, from, to) {
+    const fromSec = Math.floor(new Date(from + 'T00:00:00+06:00').getTime() / 1000);
+    const toSec = Math.floor(new Date(to + 'T23:59:59+06:00').getTime() / 1000);
+    let saleSum = 0; let saleDeals = 0;
+    Object.entries(c.currentMonthByDate || {}).forEach(([d, x]) => { if (d >= from && d <= to) { saleSum += x.sum || 0; saleDeals += x.invoices || 0; } });
+    let waCount = 0; let waOut = 0; let waIn = 0; const waDays = new Set(); let waLast = 0;
+    try {
+      whatsapp.messagesForClient(c, null).messages.forEach((m) => {
+        if (m.t > waLast) waLast = m.t;
+        if (m.t >= fromSec && m.t <= toSec) { waCount++; if (m.me) waOut++; else waIn++; waDays.add(bishkekDate(new Date(m.t * 1000))); }
+      });
+    } catch (e) { /* WhatsApp не подключён */ }
+    const v = (c.visits || []).filter((x) => { const d = bishkekDate(new Date(x.at)); return d >= from && d <= to && !VISIT_NOT_COUNTED.includes(x.status); }).sort((x, y) => (x.at < y.at ? -1 : 1));
+    return {
+      repFrom: from, repTo: to,
+      sale: { sum: Math.round(saleSum), deals: saleDeals, lastSale: c.currentMonthLastSale || null, monthSum: c.currentMonthRevenue || 0 },
+      wa: { count: waCount, out: waOut, in: waIn, days: waDays.size, lastAt: waLast || null },
+      visitCount: v.length, lastVisitAt: v.length ? v[v.length - 1].at : null
+    };
+  }
+  router.get('/api/tracker', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const today = bishkekDate(new Date());
+    const from = u.searchParams.get('from') || today;
+    const to = u.searchParams.get('to') || from;
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    const repFrom = u.searchParams.get('repFrom') || from;
+    const repTo = u.searchParams.get('repTo') || to;
+    const fromSec = Math.floor(new Date(from + 'T00:00:00+06:00').getTime() / 1000);
+    const toSec = Math.floor(new Date(to + 'T23:59:59+06:00').getTime() / 1000);
+    const agents = db.all('users').filter((x) => x.role === 'agent' && (!agentId || x.id === agentId));
+    const inP = (iso) => { const d = bishkekDate(new Date(iso)); return d >= from && d <= to; };
+    const maxJump = Math.max(100, Number(u.searchParams.get('maxJump')) || 1000);
+    const out = agents.map((a) => {
+      const rawPts = geoTrack.pings(a.id, fromSec, toSec);
+      const pts = filterTrackSpikes(rawPts, maxJump);
+      const skipped = rawPts.length - pts.length;
+      const { gaps, totalMin: offlineMin } = trackGaps(pts);
+      // «Сейчас молчит»: сегодня, рабочее время, последняя точка дольше порога назад.
+      const nowSec = Math.floor(Date.now() / 1000);
+      const nowH = new Date((nowSec + 6 * 3600) * 1000).getUTCHours();
+      const lastPt = pts.length ? pts[pts.length - 1] : null;
+      const silentNow = !!(lastPt && to >= today && nowH >= geoTrack.WORK_FROM && nowH < geoTrack.WORK_TO && bishkekDate(new Date(lastPt.t * 1000)) === today && (nowSec - lastPt.t) > TRACK_GAP_MIN * 60) ? Math.round((nowSec - lastPt.t) / 60) : 0;
+      let dist = 0;
+      for (let i = 1; i < pts.length; i++) {
+        // скачки с плохой точностью не суммируем
+        if ((pts[i].acc || 0) > 300 || (pts[i - 1].acc || 0) > 300) continue;
+        dist += haversineM(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng);
+      }
+      const visits = [];
+      db.all('clients').forEach((c) => (c.visits || []).forEach((v) => {
+        if (v.agentId === a.id && inP(v.at)) visits.push({ at: v.at, lat: v.lat, lng: v.lng, status: v.status, clientId: c.id, clientName: c.name });
+      }));
+      visits.sort((x, y) => (x.at < y.at ? -1 : 1));
+      const clients = db.all('clients').filter((c) => c.ownerId === a.id && !c.closed).map((c) => ({
+        id: c.id, name: c.name, address: c.address || '', visitDay: c.visitDay || '',
+        lat: c.geo ? c.geo.lat : null, lng: c.geo ? c.geo.lng : null,
+        visited: visits.some((v) => v.clientId === c.id && !VISIT_NOT_COUNTED.includes(v.status)),
+        // 23.10.2026: короткий отчёт по точке за период — для всплывающего окна на карте.
+        ...trackerClientInfo(c, repFrom, repTo)
+      }));
+      // Маршрут: остановки — точки подряд в радиусе 80 м дольше 8 минут; к остановке
+      // подписываем клиента с отметкой в это время или ближайшую точку клиента (до 100 м).
+      const stops = [];
+      let i0 = 0;
+      for (let i = 1; i <= pts.length; i++) {
+        const far = i === pts.length || haversineM(pts[i0].lat, pts[i0].lng, pts[i].lat, pts[i].lng) > 80;
+        if (far) {
+          const seg = pts.slice(i0, i);
+          if (seg.length && seg[seg.length - 1].t - seg[0].t >= 5 * 60) {
+            const lat = seg.reduce((x, p) => x + p.lat, 0) / seg.length;
+            const lng = seg.reduce((x, p) => x + p.lng, 0) / seg.length;
+            const from = seg[0].t, to2 = seg[seg.length - 1].t;
+            const v = visits.find((x) => { const t = new Date(x.at).getTime() / 1000; return t >= from - 300 && t <= to2 + 300; });
+            let near = null;
+            if (!v) db.all('clients').forEach((c) => { if (c.geo) { const d = haversineM(lat, lng, c.geo.lat, c.geo.lng); if (d <= 100 && (!near || d < near.d)) near = { name: c.name, d }; } });
+            // Только остановки у клиента (отметка или точка клиента рядом) — 26.10.2026.
+            if (v || near) stops.push({ lat, lng, from, to: to2, minutes: Math.round((to2 - from) / 60), place: v ? v.clientName : near.name, checkin: !!v });
+          }
+          i0 = i;
+        }
+      }
+      return {
+        agentId: a.id, agentName: a.name,
+        pings: pts, pingCount: pts.length, skippedSpikes: skipped, gaps, offlineMin, silentNow, stops,
+        firstAt: pts.length ? pts[0].t : null, lastAt: pts.length ? pts[pts.length - 1].t : null,
+        distanceKm: Math.round(dist / 100) / 10,
+        visits, clients,
+        clientsWithGeo: clients.filter((c) => c.lat != null).length,
+        last: lastLocationOf(a)
+      };
+    });
+    sendJson(res, 200, { from, to, workFrom: geoTrack.WORK_FROM, workTo: geoTrack.WORK_TO, agents: out });
+  }));
+
+  router.get('/api/reports/visits', requireStaff(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const today = bishkekDate(new Date());
+    const from = u.searchParams.get('from') || today;
+    const to = u.searchParams.get('to') || from;
+    const agentId = u.searchParams.get('agentId') ? Number(u.searchParams.get('agentId')) : null;
+    const usersById = {};
+    db.all('users').forEach((x) => { usersById[x.id] = x; });
+    const rows = [];
+    db.all('clients').forEach((c) => {
+      (c.visits || []).forEach((v) => {
+        const d = bishkekDate(new Date(v.at));
+        if (d < from || d > to) return;
+        if (agentId && v.agentId !== agentId) return;
+        rows.push({
+          ...v,
+          date: d,
+          time: new Date(v.at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bishkek' }),
+          lateHour: new Date(new Date(v.at).getTime() + 6 * 3600 * 1000).getUTCHours() >= TASK_DEADLINE_HOUR,
+          agentName: usersById[v.agentId] ? usersById[v.agentId].name : (v.agentName || '—'),
+          clientId: c.id,
+          clientName: c.name,
+          clientAddress: c.address || '',
+          pointLat: c.geo ? c.geo.lat : null,
+          pointLng: c.geo ? c.geo.lng : null,
+          visitRadius: effVisitRadius(c),
+          status: effVisitStatus(v, c),
+          ownerName: usersById[c.ownerId] ? usersById[c.ownerId].name : '—'
+        });
+      });
+    });
+    rows.sort((a, b) => (a.at < b.at ? 1 : -1));
+    // План на период — по дню визита клиента (как задачи «Посещения»): на каждую
+    // дату периода все клиенты агента с этим днём недели. Считается из карточек,
+    // а не из задач, чтобы не зависеть от передеплоев (задачи стираются).
+    const planned = {};
+    const dates = [];
+    for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z') && dates.length < 62; d.setUTCDate(d.getUTCDate() + 1)) {
+      dates.push({ key: d.toISOString().slice(0, 10), wd: WEEKDAY_BY_INDEX[d.getUTCDay()].toLowerCase() });
+    }
+    db.all('clients').forEach((c) => {
+      if (c.closed || !c.visitDay) return;
+      const wd = c.visitDay.trim().toLowerCase();
+      dates.forEach((d) => { if (d.wd === wd) (planned[c.ownerId] = planned[c.ownerId] || new Set()).add(`${d.key}|${c.id}`); });
+    });
+    const agents = db.all('users').filter((x) => x.role === 'agent' && (!agentId || x.id === agentId));
+    const summary = agents.map((a) => {
+      const mine = rows.filter((r) => r.agentId === a.id);
+      const plan = planned[a.id] || new Set();
+      const visitedKeys = new Set(mine.filter((r) => !VISIT_NOT_COUNTED.includes(r.status)).map((r) => `${r.date}|${r.clientId}`));
+      const plannedVisited = [...plan].filter((k) => visitedKeys.has(k)).length;
+      const lateCount = mine.filter((r) => r.lateHour).length;
+      const times = mine.map((r) => r.at).sort();
+      return {
+        agentId: a.id,
+        agentName: a.name,
+        visits: mine.length,
+        clients: new Set(mine.map((r) => r.clientId)).size,
+        near: mine.filter((r) => r.status === 'near').length,
+        first: mine.filter((r) => r.status === 'first').length,
+        far: mine.filter((r) => r.status === 'far').length,
+        nogps: mine.filter((r) => r.status === 'nogps' || r.status === 'lowacc').length,
+        planned: plan.size,
+        plannedVisited,
+        late: lateCount,
+        firstAt: times[0] || null,
+        lastAt: times[times.length - 1] || null
+      };
+    });
+    sendJson(res, 200, { from, to, radius: VISIT_RADIUS_M, rows, summary });
+  }));
+
+  router.get('/api/clients/export', requireAdmin(async (req, res) => {
+    const usersById = {};
+    db.all('users').forEach((u) => { usersById[u.id] = u; });
+    const clients = db.all('clients').map((c) => ({
+      name: c.name,
+      agentName: usersById[c.ownerId] ? usersById[c.ownerId].name : null,
+      phone: c.phone || '',
+      address: c.address || '',
+      contactName: c.contactName || '',
+      pointType: c.pointType || '',
+      visitRadius: c.visitRadius || null,
+      visitDay: c.visitDay || '',
+      contractStatus: c.contractStatus || '',
+      paymentMethod: c.paymentMethod || '',
+      socialContact: c.socialContact || '',
+      bestCallTime: c.bestCallTime || '',
+      decisionMakerName: c.decisionMakerName || '',
+      specialRequests: c.specialRequests || '',
+      orderWindow: c.orderWindow || '',
+      discountTerms: c.discountTerms || '',
+      salesPlan: c.salesPlan || 0,
+      routeNumber: c.routeNumber != null ? c.routeNumber : null,
+      notes: c.notes || '',
+      contactNotes: c.contactNotes || '',
+      masters: c.masters || [],
+      extraContacts: c.extraContacts || [],
+      waExcluded: c.waExcluded || [],
+      waChatAgentName: c.waChatAgentId ? ((db.find('users', c.waChatAgentId) || {}).name || null) : null,
+      isOffRoute: !!c.isOffRoute,
+      closed: !!c.closed,
+      // Фаза 43: ручные привязки номеров WhatsApp к клиенту
+      waPhones: c.waPhones || [],
+      // Отметки посещений (Фаза 40): координаты точки и журнал посещений
+      // хранятся В КАРТОЧКЕ клиента и переносятся этой же выгрузкой (решение
+      // пользователя 25.09.2026 — «в клиенты, чтобы грузить вместе с базой»).
+      // Агент в журнале — по имени (agentName), id при импорте пересчитывается.
+      geo: c.geo || null,
+      visits: (c.visits || []).map((v) => ({ ...v, agentName: usersById[v.agentId] ? usersById[v.agentId].name : (v.agentName || null) }))
+    }));
+    const buf = Buffer.from(JSON.stringify({ exportedAt: new Date().toISOString(), clients }, null, 2), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': `attachment; filename="klienty-${new Date().toISOString().slice(0, 10)}.json"`,
+      'Content-Length': buf.length
+    });
+    res.end(buf);
+  }));
+
+  // Обратная загрузка файла клиентов, ранее выгруженного через /api/clients/export
+  // (Фаза 17, 02.09.2026) — пара к этой кнопке, по тому же принципу, что и
+  // /api/tasks/import ниже. Клиент ищется ПО ИМЕНИ И АГЕНТУ (не по id — после
+  // пересборки клиенты создаются заново импортом из исходных Excel-маршрутов, и их
+  // id не совпадут со старыми; сопоставление строго в пределах агента — та же
+  // логика, что и при обычном импорте клиентов в import.js, см. технические
+  // заметки — иначе общие ярлыки вроде "Частное лицо" у разных агентов задвоятся).
+  // У уже существующих клиентов обновляет ТОЛЬКО ручные поля (тот же набор, что
+  // выгружается в /api/clients/export) — ассортимент/долг/продажи месяца не трогает,
+  // их пересчитает обычный импорт.
+  //
+  // Правка 11.09.2026 (Фаза 28, найдена и исправлена по прямому запросу
+  // пользователя — "клиенты, которых агенты завели сами, выпадают из общего
+  // списка при пересборке"): если клиента с таким именем у этого агента НЕТ —
+  // это, скорее всего, карточка, которую агент когда-то завёл сам через интерфейс
+  // (pendingApproval-поток) и которая НЕ входит в data/import/agents_clients.json,
+  // поэтому обычный импорт маршрутов её не пересоздаёт при пересборке с нуля.
+  // Раньше такая запись просто попадала в unresolved и терялась насовсем. Теперь
+  // вместо пропуска — создаём карточку заново с той же выгрузкой ручных полей
+  // (см. ниже). Единственный оставшийся источник unresolved — агент, которого нет
+  // в текущей базе вообще (переименован/удалён). Повторная загрузка того же файла
+  // по-прежнему безопасна — уже созданная карточка на второй раз просто обновится,
+  // дублей не будет.
+  router.post('/api/clients/import', requireAdmin(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const incoming = Array.isArray(body.clients) ? body.clients : [];
+    if (!incoming.length) return sendJson(res, 400, { error: 'Файл пуст или не в ожидаемом формате' });
+
+    const usersByName = {};
+    db.all('users').forEach((u) => { usersByName[norm(u.name)] = u; });
+    const clientsByKey = {};
+    db.all('clients').forEach((c) => { clientsByKey[`${c.ownerId}||${norm(c.name)}`] = c; });
+
+    const MANUAL_FIELDS = [
+      'phone', 'address', 'contactName', 'pointType', 'visitDay', 'contractStatus',
+      'paymentMethod', 'socialContact', 'bestCallTime', 'decisionMakerName', 'specialRequests',
+      'orderWindow', 'discountTerms', 'salesPlan', 'routeNumber', 'notes', 'contactNotes',
+      'masters', 'isOffRoute', 'closed', 'geo', 'waPhones', 'extraContacts', 'waExcluded'
+    ];
+    // Журнал посещений (Фаза 40) — agentId пересчитываем по имени агента;
+    // при повторной загрузке не задваиваем (ключ — время + агент).
+    function mapVisits(list) {
+      return (Array.isArray(list) ? list : []).map((v) => {
+        const a = v.agentName ? usersByName[norm(v.agentName)] : null;
+        return { ...v, agentId: a ? a.id : (v.agentId || null) };
+      });
+    }
+    function mergeVisits(existingList, incomingList) {
+      const seen = new Set((existingList || []).map((v) => `${v.at}|${v.agentName || v.agentId}`));
+      const add = incomingList.filter((v) => !seen.has(`${v.at}|${v.agentName || v.agentId}`));
+      return [...(existingList || []), ...add].sort((a, b) => (a.at < b.at ? -1 : 1)).slice(-VISITS_KEEP);
+    }
+
+    let updated = 0;
+    let created = 0;
+    const unresolved = [];
+    const now = new Date().toISOString();
+    db.beginBatch();
+    try {
+      incoming.forEach((c) => {
+        const agent = c.agentName ? usersByName[norm(c.agentName)] : null;
+        if (!agent) { unresolved.push({ reason: 'агент не найден', agentName: c.agentName, clientName: c.name }); return; }
+        const existing = clientsByKey[`${agent.id}||${norm(c.name)}`];
+        const patch = {};
+        MANUAL_FIELDS.forEach((f) => { if (c[f] !== undefined) patch[f] = c[f]; });
+        // Чей чат WhatsApp открывать по умолчанию — переносим по имени агента (id может отличаться).
+        if (c.waChatAgentName !== undefined) {
+          const wa = c.waChatAgentName ? usersByName[norm(c.waChatAgentName)] : null;
+          patch.waChatAgentId = wa ? wa.id : null;
+        }
+        if (c.visits !== undefined) patch.visits = mergeVisits(existing ? existing.visits : [], mapVisits(c.visits));
+        if (existing && existing.geo && !c.geo) delete patch.geo;
+        if (existing) {
+          db.update('clients', existing.id, patch);
+          updated++;
+        } else {
+          // Правка 11.09.2026 (Фаза 28): раньше клиент, не найденный у этого агента,
+          // просто пропускался в unresolved и терялся насовсем — именно так пропадали
+          // карточки, которые агент завёл сам через интерфейс (они не входят в
+          // data/import/agents_clients.json, поэтому обычный импорт маршрутов их не
+          // создаёт заново после пересборки с нуля). Теперь вместо пропуска — пересоздаём
+          // карточку с теми же ручными полями из выгрузки, как будто агент завёл её
+          // заново. pendingApproval: false — эта загрузка доступна только администратору
+          // (requireAdmin), восстановление уже одобренной ранее карточки не должно
+          // требовать повторного согласования супервайзером. Дефолты для остальных полей
+          // — те же, что при обычном создании клиента агентом (POST /api/clients).
+          const inserted = db.insert('clients', {
+            name: c.name,
+            ownerId: agent.id,
+            pointType: '',
+            address: '',
+            phone: '',
+            contactName: '',
+            visitDay: '',
+            contractStatus: 'неизвестно',
+            paymentMethod: '',
+            discountTerms: '',
+            salesPlan: 0,
+            notes: '',
+            isOffRoute: false,
+            pendingApproval: false,
+            regularAssortment: [],
+            testAssortment: [],
+            debtAmount: 0,
+            debtOverdue: false,
+            debtAsOf: null,
+            closed: false,
+            closureRequested: false,
+            closureRequestedBy: null,
+            contactNotes: [],
+            masters: [],
+            extraContacts: [],
+            socialContact: '',
+            bestCallTime: '',
+            decisionMakerName: '',
+            specialRequests: '',
+            orderWindow: '',
+            routeNumber: null,
+            meetingRecords: [],
+            createdAt: now,
+            ...patch
+          });
+          clientsByKey[`${agent.id}||${norm(c.name)}`] = inserted;
+          created++;
+        }
+      });
+    } finally {
+      db.endBatch();
+    }
+
+    sendJson(res, 200, { updated, created, unresolvedCount: unresolved.length, unresolved });
+  }));
+
+  // Загрузка долгов/остатков прямо через панель, без пересборки zip (Фаза 19,
+  // 04.09.2026) — пользователь явно попросил: данные статичные (снимок на
+  // дату), пересобирать из-за них весь архив не нужно. Файл — .xlsx или .csv
+  // (см. src/fileTable.js — свой ридер без внешних библиотек, LibreOffice на
+  // сервере нет, поэтому старый бинарный .xls этим путём не поддержан, только
+  // новыми экспортами/пересохранениями в .xlsx/.csv). Колонки ищутся по
+  // синонимам заголовка (см. findColumn/*_ALIASES ниже) — не по фиксированной
+  // позиции, т.к. точный набор колонок в реальном файле пользователя ещё не
+  // проверен на практике (в этой сессии не было исходного файла для сверки).
+  // Оба эндпойнта полностью ЗАМЕНЯЮТ прежний снимок (как и обычный
+  // импорт из data/import/debts.json|stock.json) — клиент, которого нет в
+  // новом файле, теряет долг (уходит в 0), это осознанное поведение "снимок
+  // на дату", а не бага.
+  function normHeaderCell(s) {
+    return (s || '').toString().trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+  }
+  function findColumn(headerRow, aliases) {
+    const normed = headerRow.map(normHeaderCell);
+    for (const alias of aliases) {
+      const idx = normed.findIndex((h) => h === alias || h.includes(alias));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  }
+  function parseUploadedTable(req) {
+    return parseMultipart(req, 10 * 1024 * 1024).then((parsed) => {
+      const file = parsed.files[0];
+      if (!file) throw new Error('Файл не найден в запросе');
+      let rows;
+      try {
+        rows = parseTableFile(file.filename, file.data);
+      } catch (e) {
+        throw new Error(`Не удалось прочитать файл (.xlsx или .csv): ${e.message}`);
+      }
+      if (!rows.length) throw new Error('Файл пустой');
+      return { header: rows[0], dataRows: rows.slice(1) };
+    });
+  }
+
+  const DEBT_NAME_ALIASES = ['контрагент', 'клиент', 'название клиента', 'наименование клиента', 'название', 'наименование', 'точка'];
+  const DEBT_AMOUNT_ALIASES = ['сумма долга', 'задолженность', 'долг', 'сумма'];
+  const DEBT_DATE_ALIASES = ['дата когда оставили', 'дата оставления', 'дата долга', 'дата поставки', 'дата накладной', 'дата платежа', 'дата оплаты', 'дата'];
+  const DEBT_OVERDUE_ALIASES = ['просрочено', 'просрочка', 'overdue'];
+
+  // Порог "критичной" просрочки — по решению пользователя (Фаза 35, вопросы
+  // по дашборду): сумма > 50 000 сом И висит больше 7 дней с даты, когда товар
+  // оставили в долг. Раньше (до Фазы 36) просрочка считалась иначе — по тому,
+  // прошла ли "дата платежа" — теперь везде единое правило.
+  const OVERDUE_MIN_AMOUNT = 3000;
+  const OVERDUE_MIN_DAYS = 7;
+  function daysSinceDate(dateStr) {
+    const m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec((dateStr || '').toString().trim());
+    if (!m) return null;
+    const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+    if (isNaN(d.getTime())) return null;
+    return Math.floor((Date.now() - d.getTime()) / 86400000);
+  }
+  function computeOverdue(amount, dateStr) {
+    const days = daysSinceDate(dateStr);
+    return amount > OVERDUE_MIN_AMOUNT && days !== null && days > OVERDUE_MIN_DAYS;
+  }
+
+  // Общая часть для обоих форматов файла (плоская таблица и "Ведомость
+  // консигнации", см. src/debtLedger.js) — сохраняет снимок на диск (чтобы
+  // при следующем деплое/рестарте runImport() тоже его подхватил, как и
+  // раньше) и применяет его к клиентам по имени.
+  function applyDebtsSnapshot(res, debts) {
+    if (!debts.length) return sendJson(res, 400, { error: 'Не нашёл ни одной строки с именем клиента и долгом' });
+    try {
+      // Фаза 42: пишем на постоянный диск — загруженные долги переживают деплой
+      // (import.js берёт import-overrides/debts.json раньше файла из проекта).
+      fs.mkdirSync(OVERRIDES_DIR, { recursive: true });
+      fs.writeFileSync(path.join(OVERRIDES_DIR, 'debts.json'), JSON.stringify(debts, null, 2), 'utf8');
+    } catch (e) {
+      return sendJson(res, 500, { error: `Файл разобрал, но не смог сохранить на диск: ${e.message}` });
+    }
+
+    // Долг — снимок на дату (как и при обычном runImport()): полностью
+    // заменяем цифры у ВСЕХ клиентов, а не только у совпавших — клиент, для
+    // которого в новом файле долга нет, считается погашенным (0), см.
+    // комментарий выше. Сопоставление — по имени (по решению пользователя, то
+    // же ограничение, что было раньше — без учёта агента).
+    const debtByName = {};
+    debts.forEach((d) => { debtByName[norm(d.client_name)] = d; });
+    const matchedKeys = new Set();
+    db.beginBatch();
+    try {
+      db.all('clients').forEach((c) => {
+        const key = norm(c.name);
+        const d = debtByName[key];
+        if (d) matchedKeys.add(key);
+        db.update('clients', c.id, {
+          debtAmount: d ? d.debt_amount : 0,
+          debtOverdue: d ? !!d.is_overdue : false,
+          debtAsOf: d ? d.payment_date : null
+        });
+      });
+    } finally {
+      db.endBatch();
+    }
+
+    // Клиенты из файла, которых не нашли в базе (переименован/это разовая
+    // "Частное лицо"/ещё не заведён в CRM) — не додумываем и не создаём,
+    // просто показываем список, как и при загрузке клиентов/задач.
+    const unmatched = debts.filter((d) => !matchedKeys.has(norm(d.client_name))).map((d) => d.client_name);
+    sendJson(res, 200, { parsedRows: debts.length, matchedClients: matchedKeys.size, unmatchedCount: unmatched.length, unmatched });
+  }
+
+  router.post('/api/debts/import', requireAdmin(async (req, res) => {
+    let table;
+    try { table = await parseUploadedTable(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const allRows = [table.header, ...table.dataRows];
+
+    // "Ведомость консигнации" — выгрузка прямо из бухгалтерской программы
+    // (Фаза 36, 21.09.2026): много блоков, один на клиента, с историей
+    // движений, а не плоская таблица. Определяем по характерному началу файла
+    // и, если это она — разбираем отдельным парсером (там же считается дата
+    // "с какой долг висит" методом FIFO по движениям внутри блока).
+    if (looksLikeConsignmentLedger(allRows)) {
+      let parsed;
+      try {
+        parsed = parseConsignmentLedger(allRows);
+      } catch (e) {
+        return sendJson(res, 400, { error: `Не удалось разобрать ведомость консигнации: ${e.message}` });
+      }
+      if (!parsed.length) {
+        return sendJson(res, 400, { error: 'Файл похож на «Ведомость консигнации», но не нашёл в нём ни одного клиента с долгом — проверьте файл' });
+      }
+      const debts = parsed.map((d) => ({
+        client_name: d.name,
+        debt_amount: d.debtAmount,
+        payment_date: d.debtSince,
+        is_overdue: computeOverdue(d.debtAmount, d.debtSince)
+      }));
+      return applyDebtsSnapshot(res, debts);
+    }
+
+    const nameIdx = findColumn(table.header, DEBT_NAME_ALIASES);
+    const amountIdx = findColumn(table.header, DEBT_AMOUNT_ALIASES);
+    const dateIdx = findColumn(table.header, DEBT_DATE_ALIASES);
+    const overdueIdx = findColumn(table.header, DEBT_OVERDUE_ALIASES);
+    if (nameIdx === -1 || amountIdx === -1) {
+      return sendJson(res, 400, {
+        error: 'Не нашёл в заголовках колонки «клиент»/«сумма долга» — переименуйте заголовки в файле или пришлите его мне, поправлю сопоставление',
+        headerFound: table.header
+      });
+    }
+
+    const debts = [];
+    table.dataRows.forEach((r) => {
+      const name = (r[nameIdx] || '').toString().trim();
+      if (!name) return;
+      const amount = parseFloat(String(r[amountIdx] || '0').replace(',', '.')) || 0;
+      const paymentDate = dateIdx !== -1 ? (r[dateIdx] || '').toString().trim() || null : null;
+      let isOverdue;
+      if (overdueIdx !== -1) {
+        // Явная колонка "просрочено" в файле — доверяем ей как есть (то, что
+        // сама бухгалтерская/учётная система уже посчитала).
+        const raw = normHeaderCell(r[overdueIdx]);
+        isOverdue = raw === 'да' || raw === 'true' || raw === '1' || raw === 'yes';
+      } else {
+        // Явной колонки нет — считаем сами по единому правилу (сумма > 50 000
+        // сом И больше 7 дней с даты, когда товар оставили в долг).
+        isOverdue = computeOverdue(amount, paymentDate);
+      }
+      debts.push({ client_name: name, debt_amount: amount, is_overdue: isOverdue, payment_date: paymentDate });
+    });
+    applyDebtsSnapshot(res, debts);
+  }));
+
+  // Загрузка остатков склада через панель (POST /api/stock/import) убрана по
+  // просьбе пользователя (Фаза 24, 09.09.2026 — «убери остаток кол-во везде
+  // где он есть он больше не нужен»). data/import/stock.json (если был
+  // загружен раньше) на диске не трогали — просто больше ничем не читается;
+  // attachStock() в src/import.js по-прежнему подмешивает эти данные в
+  // stockQty/stockUnit при обычном импорте, но фронтенд их больше не
+  // показывает (см. stockBadgeHtml() в public/app.js). Если понадобится вернуть
+  // фичу — история реализации в claude/crm-mvp-status.md, Фаза 6.1/19.
+
+  // Обратная загрузка ранее выгруженного файла (после пересборки/передеплоя) —
+  // восстанавливает задачи, сопоставляя клиента и агента ПО ИМЕНИ (не по id, см.
+  // комментарий выше у /api/tasks/export). Задачи, для которых клиент или агент не
+  // нашлись (например, клиента переименовали или он был удалён), пропускаются и
+  // перечисляются в ответе — ничего не додумываем и не создаём "на угад". Уже
+  // существующие задачи (то же имя клиента + заголовок + срок + дата создания) не
+  // дублируются — можно безопасно загрузить один и тот же файл повторно.
+  router.post('/api/tasks/import', requireStaff(async (req, res) => {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const incoming = Array.isArray(body.tasks) ? body.tasks : [];
+    if (!incoming.length) return sendJson(res, 400, { error: 'Файл пуст или не в ожидаемом формате' });
+
+    const clientsByName = {};
+    db.all('clients').forEach((c) => { clientsByName[norm(c.name)] = c; });
+    const usersByName = {};
+    db.all('users').forEach((u) => { usersByName[norm(u.name)] = u; });
+    const clientsById = {};
+    db.all('clients').forEach((c) => { clientsById[c.id] = c; });
+    // Найдено 18.09.2026 (жалоба «задачи по агенту при загрузке исчезли
+    // комментарии» — проверка показала не потерю данных в самом импорте, а
+    // то, что «Задачи агенту» (taskType 'agent', clientId null) при КАЖДОЙ
+    // повторной загрузке одного и того же файла создавались заново вместо
+    // того, чтобы распознаваться как уже существующие — в файле пользователя
+    // нашлось 13 групп по 3 идентичные копии каждой такой задачи, тогда как
+    // среди задач с клиентом (визит/продажа/лист ожидания) дублей не было ни
+    // одного. Причина — этот ключ для уже существующих в базе задач, при
+    // clientId === null, строился на «голом» t.clientId (JS Array.join
+    // превращает null в '' при склейке через '||'), а ключ у ВХОДЯЩЕЙ задачи
+    // ниже — на строке `agent:${t.title}` (непустая) — ключи никогда не
+    // совпадали, `existingKeys.has(...)` всегда возвращал false для «Задач
+    // агенту», и дедупликация для них попросту не работала. Задача-дубликат
+    // из-за этого визуально выглядела как «та же самая задача, но без
+    // комментария», хотя технически комментарий оставался цел у оригинала —
+    // просто рядом появлялась пустая копия. Исправлено — тот же самый принцип
+    // построения ключа (по taskType === 'agent'), что и у входящей задачи ниже.
+    const existingKeys = new Set(
+      db.all('tasks').map((t) => {
+        const c = clientsById[t.clientId];
+        const keyPrefix = t.taskType === 'agent' ? `agent:${t.title}` : (c ? norm(c.name) : t.clientId);
+        return [keyPrefix, t.title, t.dueDate, t.createdAt].join('||');
+      })
+    );
+
+    const existingCheckin = new Set(db.all('tasks').filter((t) => t.taskType === 'checkin').map((t) => `${t.clientId}|${t.dueDate}`));
+    let imported = 0, skippedDuplicate = 0;
+    const unresolved = [];
+    incoming.forEach((t) => {
+      // П.6 бэклога (08.09.2026): задачи воронки "Задачи агенту" (taskType === 'agent')
+      // изначально без clientName (задача не привязана к клиенту) — старая проверка
+      // "клиент не найден" пометила бы их все как unresolved и молча выбросила при
+      // восстановлении из резервной выгрузки. Для этого типа клиент не ищем вовсе.
+      const isAgentTask = t.taskType === 'agent';
+      const client = !isAgentTask && t.clientName ? clientsByName[norm(t.clientName)] : null;
+      if (!isAgentTask && !client) { unresolved.push({ reason: 'клиент не найден', clientName: t.clientName, title: t.title }); return; }
+      const assignee = t.agentName ? usersByName[norm(t.agentName)] : null;
+      if (isAgentTask && !assignee) { unresolved.push({ reason: 'агент не найден', clientName: t.clientName, title: t.title }); return; }
+      const assigneeId = assignee ? assignee.id : (client ? client.ownerId : null);
+      const key = [client ? norm(client.name) : `agent:${t.title}`, t.title, t.dueDate, t.createdAt].join('||');
+      if (existingKeys.has(key)) { skippedDuplicate++; return; }
+      // «Посещение» — одна задача на клиента в день: не задваиваем с уже
+      // созданной кнопкой на ту же дату.
+      if (t.taskType === 'checkin' && client && existingCheckin.has(`${client.id}|${t.dueDate}`)) { skippedDuplicate++; return; }
+      const creator = t.createdByName ? usersByName[norm(t.createdByName)] : null;
+      // Файл резервной выгрузки может быть сделан ДО обновления кода и содержать
+      // уже отменённые значения stage ("call"/"meeting"/"deal"/"fail"/"waiting"/
+      // "failed") — без этой нормализации задача вставится "как есть" и станет
+      // невидимой на доске (текущие колонки знают только актуальные ключи
+      // TASK_STAGES/WAITLIST_STAGES), т.к. миграция при старте сервера применяется
+      // только к уже хранящимся записям, а не к тем, что приходят через импорт
+      // уже после старта (см. normalizeLegacyTaskStage выше — Фаза 22, 08.09.2026).
+      const taskType = t.taskType === 'sale' ? 'sale' : (t.taskType === 'waitlist' ? 'waitlist' : (t.taskType === 'checkin' ? 'checkin' : (isAgentTask ? 'agent' : 'visit')));
+      const legacyNorm = normalizeLegacyTaskStage({
+        taskType, stage: t.stage || 'in_progress', tags: t.tags, report: t.report, explanation: t.explanation
+      });
+      db.insert('tasks', {
+        clientId: client ? client.id : null,
+        taskType,
+        title: t.title || '',
+        description: t.description || '',
+        dueDate: t.dueDate,
+        visitTime: t.visitTime || '',
+        visitTimeTo: t.visitTimeTo || '',
+        stage: legacyNorm.stage,
+        tags: legacyNorm.tags,
+        comment: t.comment || '',
+        report: legacyNorm.report !== undefined ? legacyNorm.report : (t.report || ''),
+        explanation: t.explanation || '',
+        dateChangeRequest: null,
+        attachments: [],
+        assigneeId,
+        createdBy: creator ? creator.id : req.user.id,
+        checkinAt: t.checkinAt || null,
+        lateCheckin: !!t.lateCheckin,
+        createdAt: t.createdAt || new Date().toISOString(),
+        updatedAt: t.updatedAt || new Date().toISOString()
+      });
+      existingKeys.add(key);
+      if (taskType === 'checkin' && client) existingCheckin.add(`${client.id}|${t.dueDate}`);
+      imported++;
+    });
+    // Отметки из карточек клиентов закрывают загруженные открытые «Посещения».
+    syncCheckinTasks();
+
+    sendJson(res, 200, { imported, skippedDuplicate, unresolvedCount: unresolved.length, unresolved });
+  }));
+
+  // ---- Отчёты (супервайзер/администратор) ----
+
+  // Ассортимент по агентам: товар/бренд/шт/выручка/кол-во клиентов, с фильтром
+  // по бренду, по конкретному агенту (или "Все") и по конкретному месяцу (или
+  // "Все месяцы" — тогда как раньше, 7-месячная агрегация regular/testAssortment;
+  // при выборе месяца — построчные данные из client.monthlyAssortment[month]).
+  router.get('/api/reports/assortment-by-agent', requireStaff(async (req, res) => {
+    const params = new URL(req.url, 'http://internal').searchParams;
+    const brandFilter = params.get('brand');
+    const agentIdFilter = params.get('agentId');
+    // "month" может быть одним месяцем ("август") или несколькими через запятую
+    // ("июнь,июль,август") — правка "несколько месяцев сразу" в Отчётах (31.08.2026).
+    // При нескольких месяцах строки по одному товару у одного клиента суммируются
+    // по всем выбранным месяцам (qty/revenue складываются).
+    const monthFilterRaw = params.get('month');
+    const selectedMonths = (monthFilterRaw && monthFilterRaw !== 'all')
+      ? monthFilterRaw.split(',').map((m) => m.trim()).filter((m) => MONTH_ORDER.includes(m))
+      : [];
+    let agents = db.all('users').filter((u) => u.role === 'agent');
+    if (agentIdFilter) agents = agents.filter((a) => a.id === Number(agentIdFilter));
+    const clients = db.all('clients');
+    const useMonth = selectedMonths.length > 0;
+
+    const rows = [];
+    agents.forEach((agent) => {
+      const aClients = clients.filter((c) => c.ownerId === agent.id);
+      const byProduct = {};
+      aClients.forEach((c) => {
+        const items = useMonth
+          ? selectedMonths.flatMap((m) => (c.monthlyAssortment && c.monthlyAssortment[m] || []).map((it) => ({ ...it, avgQty: it.qty })))
+          : [...(c.regularAssortment || []), ...(c.testAssortment || [])];
+        items.forEach((it) => {
+          if (brandFilter && brandFilter !== 'all' && it.brand !== brandFilter) return;
+          if (brandFilter === 'colorants' && it.category !== 'Краситель' && it.category !== 'Оксид') return;
+          const key = it.product;
+          if (!byProduct[key]) byProduct[key] = { product: it.product, brand: it.brand, category: it.category, qty: 0, revenue: 0, clientIds: new Set() };
+          byProduct[key].qty += it.avgQty || 0;
+          byProduct[key].revenue += it.revenue || 0;
+          byProduct[key].clientIds.add(c.id);
+        });
+      });
+      Object.values(byProduct).forEach((row) => {
+        rows.push({
+          agentId: agent.id, agentName: agent.name,
+          product: row.product, brand: row.brand, category: row.category,
+          qty: Math.round(row.qty * 100) / 100, revenue: Math.round(row.revenue),
+          clientsCount: row.clientIds.size
+        });
+      });
+    });
+
+    // Правка Фазы 14 (01.09.2026): добавлены Studio и AV/ES/PRO/MS — новые
+    // бренды после уточнения пользователем расшифровки буквенных префиксов
+    // (см. brand_tagging.py в исходных данных). "Прочее" оставлен — редкий
+    // остаточный хвост нераспознанных названий на латинице (единицы строк).
+    const brands = ['Классика', 'Мясные', 'Премиум'];
+    sendJson(res, 200, {
+      rows: rows.sort((a, b) => b.revenue - a.revenue),
+      brands,
+      months: MONTH_ORDER,
+      agents: db.all('users').filter((u) => u.role === 'agent').map((a) => ({ id: a.id, name: a.name }))
+    });
+  }));
+
+  // Отчёт "Акции" (GET /api/reports/promotions) убран по просьбе пользователя
+  // (Фаза 24, 09.09.2026) вместе со всей фичей акций по клиентам — см.
+  // withFreshCurrentMonth() выше (promotions теперь всегда []) и /api/stats
+  // ниже (карточки акций убраны из дашборда агента/команды).
+
+  // ---- Дашборд ----
+
+  router.get('/api/stats', requireAuth(async (req, res) => {
+    const clients = withFreshCurrentMonth(scoped(db.all('clients'), req.user, 'ownerId'));
+    const tasks = scoped(db.all('tasks'), req.user, 'assigneeId');
+    const today = bishkekToday();
+    const overdueTasks = tasks.filter(isTaskOverdue);
+    const todayTasks = tasks.filter((t) => isActiveStage(t) && t.dueDate === today);
+    const atRiskClients = clients.filter((c) => (c.regularAssortment || []).some((p) => p.atRisk));
+    const pendingApproval = clients.filter((c) => c.pendingApproval).length;
+    const totalDebt = clients.reduce((s, c) => s + (c.debtAmount || 0), 0);
+
+    const byStage = TASK_STAGES.map((s) => ({
+      key: s.key, label: s.label, count: tasks.filter((t) => t.taskType !== 'sale' && t.stage === s.key).length
+    }));
+    // С Фазы 22 у 'sale' те же этапы, что и у визита (TASK_STAGES) — отдельного
+    // SALE_STAGES больше нет, но разбивку по продажам оставляем отдельным блоком
+    // (у неё своя вкладка в интерфейсе).
+    const byStageSale = TASK_STAGES.map((s) => ({
+      key: s.key, label: s.label, count: tasks.filter((t) => t.taskType === 'sale' && t.stage === s.key).length
+    }));
+
+    const todayClientIds = new Set(todayTasks.map((t) => t.clientId));
+    const todayClientsWithDebt = clients.filter((c) => todayClientIds.has(c.id) && c.debtAmount > 0);
+
+    const payload = {
+      clientsCount: clients.length,
+      todayTasksCount: todayTasks.length,
+      overdueTasksCount: overdueTasks.length,
+      atRiskClientsCount: atRiskClients.length,
+      pendingApprovalCount: pendingApproval,
+      totalDebt,
+      byStage,
+      todayTasks,
+      overdueTasks,
+      todayClientsWithDebt
+    };
+
+    if (isStaff(req.user)) {
+      const agents = db.all('users').filter((u) => u.role === 'agent');
+      const allTasks = db.all('tasks');
+      const allClients = withFreshCurrentMonth(db.all('clients'));
+
+      // Бренд-корзины для плана/факта по брендам (Фаза 37) — те же 3 категории,
+      // что и в файле пользователя "Проекция продажи..." (EPICA / Kapous /
+      // Остальное — всё, что не EPICA и не Kapous, попадает в "Остальное").
+      const BRAND_BUCKETS = ['Мясные', 'Премиум', 'Классика'];
+      function bucketOfBrand(brand) {
+        return (brand === 'Мясные' || brand === 'Премиум') ? brand : 'Классика';
+      }
+      // Фаза 39: по бренд-корзинам считаем из ТОВАРНЫХ СТРОК СРЕЗА агента
+      // (а не из карточек его клиентов) — см. agentSalesFact().
+      function actualByBrandBucket(items) {
+        const map = { Мясные: 0, Премиум: 0, 'Классика': 0 };
+        (items || []).forEach((it) => { map[bucketOfBrand(it.brand)] += (it.revenue || 0); });
+        return map;
+      }
+
+      payload.byAgent = agents.map((agent) => {
+        const aTasks = allTasks.filter((t) => t.assigneeId === agent.id);
+        const done = aTasks.filter((t) => t.stage === 'done').length;
+        const notDone = aTasks.filter((t) => t.stage === 'not_done').length;
+        const closed = done + notDone;
+        const agentClients = allClients.filter((c) => c.ownerId === agent.id);
+        const agentDebt = agentClients.reduce((s, c) => s + (c.debtAmount || 0), 0);
+        // План vs факт по агенту (Фаза 36) — план теперь одна цифра на агента
+        // в месяц (см. /api/users/:id/plan выше), факт — сумма currentMonthRevenue
+        // клиентов агента (то же самое поле, что и раньше в per-client расчёте
+        // «Выполнение плана», просто сгруппировано по агенту, а не по всей команде).
+        const monthlyPlan = agent.monthlyPlan || 0;
+        const fact = agentSalesFact(agent.name);
+        const actualThisMonth = fact.total || 0;
+        const overdueCount = aTasks.filter(isTaskOverdue).length;
+        return {
+          agentId: agent.id,
+          agentName: agent.name,
+          totalTasks: aTasks.length,
+          done,
+          notDone,
+          open: aTasks.filter(isActiveStage).length,
+          completionRate: closed ? Math.round((done / closed) * 100) : null,
+          totalDebt: agentDebt,
+          monthlyPlan,
+          actualThisMonth,
+          planPct: monthlyPlan ? Math.round((actualThisMonth / monthlyPlan) * 100) : null,
+          overdueCount,
+          // Планы по брендам (Фаза 37, 21.09.2026) — статичные значения из
+          // data/import/brand_plans.json (см. комментарий в src/import.js),
+          // прописаны пользователем и не редактируются из интерфейса, пока не
+          // будет новой задачи на изменение. null, если у агента плана нет.
+          brandPlans: agent.brandPlans || null,
+          actualByBrand: actualByBrandBucket(fact.items),
+          salesPeriod: fact.period || ''
+        };
+      });
+
+      // Критичные долги (Фаза 36) — тот же порог, что и при загрузке долгов
+      // (src/debtLedger.js / /api/debts/import): сумма > 50 000 сом и висит
+      // больше 7 дней (client.debtOverdue уже посчитан на загрузке). Отдельный
+      // список для дашборда — самые крупные/старые долги сверху, без похода
+      // клиента по всей таблице «Клиенты» с фильтром.
+      payload.criticalDebts = allClients
+        .filter((c) => c.debtOverdue && c.debtAmount > 0)
+        .map((c) => {
+          let daysOverdue = null;
+          const m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec((c.debtAsOf || '').trim());
+          if (m) {
+            const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+            if (!isNaN(d.getTime())) daysOverdue = Math.floor((Date.now() - d.getTime()) / 86400000);
+          }
+          return { clientId: c.id, clientName: c.name, ownerId: c.ownerId, debtAmount: c.debtAmount, debtAsOf: c.debtAsOf, daysOverdue };
+        })
+        .sort((a, b) => b.debtAmount - a.debtAmount)
+        .slice(0, 30);
+
+      // Явный общий итог по всей команде — чтобы у супервайзера точно было видно
+      // суммарное количество задач по сотрудникам, а не только разбивку по одному.
+      payload.teamTotals = {
+        totalTasks: allTasks.length,
+        open: allTasks.filter(isActiveStage).length,
+        done: allTasks.filter((t) => t.stage === 'done').length,
+        notDone: allTasks.filter((t) => t.stage === 'not_done').length,
+        archived: allTasks.filter((t) => t.stage === 'archive').length
+      };
+      payload.byStageSale = byStageSale;
+
+      // Задачи на день по команде: сколько всего/выполнено/не выполнено сегодня у каждого агента.
+      payload.teamTasksToday = agents.map((agent) => {
+        const aToday = allTasks.filter((t) => t.assigneeId === agent.id && t.dueDate === today);
+        return {
+          agentId: agent.id,
+          agentName: agent.name,
+          total: aToday.length,
+          done: aToday.filter((t) => t.stage === 'done' || t.stage === 'deal').length,
+          notDone: aToday.filter((t) => t.stage === 'not_done' || t.stage === 'fail').length
+        };
+      });
+
+      payload.pendingClosureCount = allClients.filter((c) => c.closureRequested).length;
+      payload.newMastersCount = allClients.reduce((s, c) => s + (c.masters || []).filter((m) => m.isNew).length, 0);
+
+      // Рейтинг клиентов: выручка/маржа/активные месяцы — считается из тех же файлов
+      // продаж (поля revenue/margin у позиций ассортимента, см. build_test_assortment.py
+      // и обновлённый aggregate.py). Если данные ещё не пересчитаны — просто будут нули.
+      payload.clientRating = allClients
+        .map((c) => {
+          const items = [...(c.regularAssortment || []), ...(c.testAssortment || [])];
+          const revenue = items.reduce((s, it) => s + (it.revenue || 0), 0);
+          const margin = items.reduce((s, it) => s + (it.margin || 0), 0);
+          const activeMonths = items.reduce((mx, it) => Math.max(mx, it.monthsCount || 0), 0);
+          const owner = agents.find((a) => a.id === c.ownerId);
+          return {
+            clientId: c.id, clientName: c.name, agentName: owner ? owner.name : '',
+            revenue, margin, marginPct: revenue ? Math.round((margin / revenue) * 100) : 0, activeMonths
+          };
+        })
+        .filter((r) => r.revenue > 0)
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 50);
+
+      // Клиенты, у которых день визита выпадает на текущую неделю, но задачи на неё пока нет.
+      const now = new Date();
+      const weekStart = new Date(now); weekStart.setHours(0, 0, 0, 0);
+      const dow = (weekStart.getDay() + 6) % 7; // 0=понедельник
+      weekStart.setDate(weekStart.getDate() - dow);
+      const weekDates = [];
+      for (let i = 0; i < 7; i++) { const d = new Date(weekStart); d.setDate(weekStart.getDate() + i); weekDates.push(d.toISOString().slice(0, 10)); }
+      const weekIdxByDay = {};
+      VISIT_DAYS.forEach((name) => {
+        const idx = VISIT_DAY_INDEX[name] - 1; // 0=понедельник ... 5=суббота
+        weekIdxByDay[name] = weekDates[idx];
+      });
+      payload.noTaskThisWeek = allClients.filter((c) => {
+        if (c.closed || !c.visitDay || !weekIdxByDay[c.visitDay]) return false;
+        const dateForThisWeek = weekIdxByDay[c.visitDay];
+        return !allTasks.some((t) => t.clientId === c.id && t.dueDate === dateForThisWeek);
+      });
+
+      // Карточка "Акции" в дашборде супервайзера убрана по просьбе пользователя
+      // (Фаза 24, 09.09.2026) вместе со всей фичей акций — см. withFreshCurrentMonth().
+
+      // "Выполнение" в сомах + разбивка по брендам (п.10 правок 31.08.2026) — план
+      // против факта этого месяца, по всей команде; пересчёт при смене фильтра по
+      // агенту делается на клиенте (app.js), т.к. state.clients у супервайзера и
+      // так содержит все нужные поля.
+      // Фаза 36 (21.09.2026): план — сумма agent.monthlyPlan (новое поле на агенте,
+      // см. /api/users/:id/plan), а не старый per-client salesPlan (он так и не
+      // используется — 0 из 720 клиентов). Пока ни один агент план не проставил —
+      // planTotal будет 0, это ожидаемо, а не баг.
+      const planTotal = agents.reduce((s, a) => s + (a.monthlyPlan || 0), 0);
+      // Фаза 39: факт команды = сумма «Итого» срезов всех агентов.
+      const agentFacts = agents.map((a) => agentSalesFact(a.name));
+      const actualTotal = agentFacts.reduce((s, f) => s + (f.total || 0), 0);
+      const byBrandMap = {};
+      agentFacts.forEach((f) => {
+        (f.items || []).forEach((it) => {
+          const b = it.brand || 'Прочее';
+          byBrandMap[b] = (byBrandMap[b] || 0) + (it.revenue || 0);
+        });
+      });
+      // Короткая сверка «сумма продаж / сумма по клиентам» — показывается на
+      // дашборде, только если не сходится (правило пользователя, Фаза 39).
+      payload.salesChecks = agentSalesChecks().filter((ch) => ch.diff !== 0 || (ch.unmatched || []).length);
+      payload.salesPerformance = {
+        planTotal,
+        actualTotal,
+        byBrand: Object.entries(byBrandMap).map(([brand, revenue]) => ({ brand, revenue })).sort((a, b) => b.revenue - a.revenue)
+      };
+
+      // Сравнение периодов для «Отчётов» (Фаза 36) — этот месяц (нарастающим
+      // итогом на сегодня, current_month_sales.json) против последнего ПОЛНОСТЬЮ
+      // закрытого месяца из 7-месячного окна (monthlyAssortment). Не идеально
+      // сравнимо день-в-день (там весь месяц, здесь — срез на сегодня), но лучше,
+      // чем ничего, и подписано явно на фронте, чтобы не вводить в заблуждение.
+      const lastClosedMonth = MONTH_ORDER[MONTH_ORDER.length - 1];
+      function lastMonthRevenue(list) {
+        return list.reduce((s, c) => s + ((c.monthlyAssortment && c.monthlyAssortment[lastClosedMonth]) || []).reduce((s2, it) => s2 + (it.revenue || 0), 0), 0);
+      }
+      payload.periodComparison = {
+        lastClosedMonth,
+        thisMonthSoFar: actualTotal,
+        lastMonthTotal: lastMonthRevenue(allClients),
+        byAgent: agents.map((agent) => {
+          const agentClients = allClients.filter((c) => c.ownerId === agent.id);
+          return {
+            agentId: agent.id,
+            agentName: agent.name,
+            thisMonthSoFar: agentSalesFact(agent.name).total || 0,
+            lastMonthTotal: lastMonthRevenue(agentClients)
+          };
+        })
+      };
+    }
+
+    // Метрики для отдельного дашборда агента (продажи, клиенты, топ-товары, встречи/звонки).
+    // Список правок после Фазы 6.1: "Продано" и "Клиентов с продажами" — теперь за
+    // ТЕКУЩИЙ месяц (не за 7 мес.), топ-товаров — топ-10 отдельно по трём брендам за
+    // текущий месяц (Kapous/EPICA без красителей и оксидов), а не общий топ-5 за 7 мес.
+    if (req.user.role === 'agent') {
+      // Фаза 39: «Продано в этом месяце» и топы агента — из его среза («Итого»
+      // последнего файла и его товарные строки), а не из карточек клиентов.
+      const myFact = agentSalesFact(req.user.name);
+      const monthItems = myFact.items || [];
+      const salesTotalThisMonth = myFact.total || 0;
+      const clientsBoughtThisMonth = clients.filter((c) => (c.currentMonthRevenue || 0) > 0).length;
+      const clientsNotBoughtThisMonth = clients.length - clientsBoughtThisMonth;
+
+      const topByBrand = (brand, excludeColorants) => {
+        const filtered = monthItems.filter((it) => it.brand === brand
+          && (!excludeColorants || (it.category !== 'Оксид' && it.category !== 'Краситель')));
+        const byProduct = {};
+        filtered.forEach((it) => {
+          if (!it.product) return;
+          if (!byProduct[it.product]) byProduct[it.product] = { product: it.product, qty: 0, revenue: 0 };
+          byProduct[it.product].qty += it.qty || 0;
+          byProduct[it.product].revenue += it.revenue || 0;
+        });
+        return Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+      };
+
+      const myTasksAll = db.all('tasks').filter((t) => t.assigneeId === req.user.id);
+      const saleTasksToday = myTasksAll.filter((t) => t.taskType === 'sale' && t.dueDate === today);
+
+      // Карточка "Акции" на дашборде агента убрана по просьбе пользователя
+      // (Фаза 24, 09.09.2026) вместе со всей фичей акций — см. withFreshCurrentMonth().
+
+      // Полная сумма продаж за все 7 месяцев (не только текущий) + разбивка по
+      // клиентам — правка 31.08.2026 (п.9): "сумма из отчётов по реализации
+      // полностью". Разбивка по клиентам форматируется через "/" в интерфейсе
+      // (см. app.js) — сама по себе это список "клиент: сумма".
+      const salesTotalAllMonths = clients.reduce((s, c) => {
+        const items = [...(c.regularAssortment || []), ...(c.testAssortment || [])];
+        return s + items.reduce((s2, it) => s2 + (it.revenue || 0), 0);
+      }, 0);
+      const salesByClientAllMonths = clients
+        .map((c) => {
+          const items = [...(c.regularAssortment || []), ...(c.testAssortment || [])];
+          const revenue = items.reduce((s2, it) => s2 + (it.revenue || 0), 0);
+          return { clientId: c.id, clientName: c.name, revenue };
+        })
+        .filter((r) => r.revenue > 0)
+        .sort((a, b) => b.revenue - a.revenue);
+
+      payload.agentDashboard = {
+        salesTotalThisMonth,
+        salesPeriod: myFact.period || '',
+        clientsBoughtThisMonth,
+        clientsNotBoughtThisMonth,
+        salesTotalAllMonths,
+        salesByClientAllMonths,
+        topByBrand: {
+          Премиум: topByBrand('Премиум', true),
+          Мясные: topByBrand('Мясные', true),
+          Классика: topByBrand('Классика', false)
+        },
+        atRiskClientsCount: atRiskClients.length,
+        // С Фазы 22 у 'sale' нет отдельных этапов "звонок"/"встреча" — вместо них
+        // считаем задачи "Продажа" на сегодня (всего/закрыто), см. saleTasksToday выше.
+        salesToday: saleTasksToday.length,
+        // 21.10.2026: «Общий план по клиентам» — сумма планов из карточек (без закрытых).
+        clientsPlanTotal: clients.filter((c) => !c.closed).reduce((s, c) => s + (Number(c.salesPlan) || 0), 0),
+        clientsPlanFact: clients.filter((c) => !c.closed && Number(c.salesPlan) > 0).reduce((s, c) => s + (Number(c.currentMonthRevenue) || 0), 0),
+        salesDoneToday: saleTasksToday.filter((t) => t.stage === 'done').length,
+        doneTasksToday: tasks.filter((t) => t.dueDate === today && t.stage === 'done').length,
+        overdueTasksCount: overdueTasks.length
+      };
+    }
+
+    sendJson(res, 200, payload);
+  }));
+
+  // ---------- WhatsApp (Фаза 43, 02.10.2026) ----------
+  // Подключение номера агента по QR, чтение переписки, привязка к клиентам.
+  // Админ/супервайзер видят всех агентов и всю переписку; агент — только свой номер.
+  function waCanManage(user, agentId) {
+    return isStaff(user) || user.id === Number(agentId);
+  }
+  function waAgentFilter(user) {
+    return isStaff(user) ? null : user.id;
+  }
+
+  router.get('/api/whatsapp/status', requireAuth(async (req, res) => {
+    await whatsapp.loadLib();
+    const agents = db.all('users')
+      .filter((u) => u.role === 'agent' && (isStaff(req.user) || u.id === req.user.id))
+      .map((u) => Object.assign({ id: u.id, name: u.name }, whatsapp.statusOf(u.id)));
+    sendJson(res, 200, { lib: whatsapp.libStatus(), agents });
+  }));
+
+  router.post('/api/whatsapp/:id/connect', requireAuth(async (req, res, params) => {
+    const agent = db.find('users', params.id);
+    if (!agent || agent.role !== 'agent') return sendJson(res, 404, { error: 'Агент не найден' });
+    if (!waCanManage(req.user, agent.id)) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    await whatsapp.connect(agent.id);
+    sendJson(res, 200, Object.assign({ id: agent.id, name: agent.name }, whatsapp.statusOf(agent.id)));
+  }));
+
+  router.post('/api/whatsapp/:id/disconnect', requireAuth(async (req, res, params) => {
+    const agent = db.find('users', params.id);
+    if (!agent || agent.role !== 'agent') return sendJson(res, 404, { error: 'Агент не найден' });
+    if (!waCanManage(req.user, agent.id)) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const body = await readBody(req).catch(() => ({}));
+    await whatsapp.disconnect(agent.id, body.logout !== false);
+    sendJson(res, 200, Object.assign({ id: agent.id, name: agent.name }, whatsapp.statusOf(agent.id)));
+  }));
+
+  router.get('/api/whatsapp/unmatched', requireAuth(async (req, res) => {
+    sendJson(res, 200, { chats: whatsapp.unmatchedChats(waAgentFilter(req.user)) });
+  }));
+
+  router.get('/api/whatsapp/summary', requireAuth(async (req, res) => {
+    sendJson(res, 200, { clients: whatsapp.clientSummary(waAgentFilter(req.user)) });
+  }));
+
+  router.get('/api/whatsapp/chat', requireAuth(async (req, res) => {
+    const q = url.parse(req.url, true).query;
+    const agentId = Number(q.agentId);
+    if (!waCanManage(req.user, agentId)) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    sendJson(res, 200, { messages: whatsapp.withMediaFlags(whatsapp.chatMessages(agentId, String(q.key || ''))) });
+  }));
+
+  router.get('/api/clients/:id/whatsapp', requireAuth(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    if (req.user.role === 'agent' && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const r = whatsapp.messagesForClient(client, waAgentFilter(req.user));
+    sendJson(res, 200, {
+      keys: r.keys.map((k) => {
+        const contact = (client.extraContacts || []).find((x) => whatsapp.phoneKeysFromString(x.phone).includes(k));
+        const fromPhone = whatsapp.phoneKeysFromString(client.phone).includes(k);
+        return {
+          key: k,
+          display: whatsapp.displayKey(k),
+          manual: (client.waPhones || []).includes(k),
+          source: (client.waPhones || []).includes(k) ? 'manual' : fromPhone ? 'phone' : contact ? 'contact' : 'other',
+          // 09.10.2026: номер доп. контакта — подпись «Имя (роль)» в ленте и на вкладке чата
+          asContact: contact ? (contact.role ? `${contact.name} (${contact.role})` : contact.name) : null
+        };
+      }),
+      messages: whatsapp.withMediaFlags(r.messages),
+      excluded: (client.waExcluded || []).map((k) => ({ key: k, display: whatsapp.displayKey(k) }))
+    });
+  }));
+
+  // 09.10.2026: с одним клиентом переписываются несколько агентов — админ/супервайзер
+  // выбирает, чей чат открывать в карточке по умолчанию (иначе — ответственного агента).
+  router.put('/api/clients/:id/wa-agent', requireStaff(async (req, res, params) => {
+    const client = db.find('clients', params.id);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    const agentId = body.agentId ? Number(body.agentId) : null;
+    if (agentId && !db.find('users', agentId)) return sendJson(res, 400, { error: 'Агент не найден' });
+    const updated = db.update('clients', client.id, { waChatAgentId: agentId });
+    sendJson(res, 200, { client: withFreshCurrentMonth([updated])[0] });
+  }));
+
+  // Файл вложения (фото/голосовое/документ/видео). Агент — только своего номера.
+  router.get('/api/whatsapp/media/:agentId/:msgId', requireAuth(async (req, res, params) => {
+    if (!waCanManage(req.user, params.agentId)) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const m = whatsapp.mediaForMessage(params.agentId, params.msgId);
+    if (!m) return sendJson(res, 404, { error: 'Файл не найден' });
+    const stat = fs.statSync(m.file);
+    const headers = {
+      'Content-Type': m.mime,
+      'Cache-Control': 'private, max-age=86400',
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': 'inline; filename*=UTF-8\'\'' + encodeURIComponent(m.name)
+    };
+    // Range — чтобы аудио/видео можно было перематывать (и для Safari)
+    const range = req.headers.range && /bytes=(\d*)-(\d*)/.exec(req.headers.range);
+    if (range) {
+      const start = range[1] ? Number(range[1]) : 0;
+      const end = range[2] ? Math.min(Number(range[2]), stat.size - 1) : stat.size - 1;
+      res.writeHead(206, Object.assign(headers, { 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 }));
+      fs.createReadStream(m.file, { start, end }).pipe(res);
+      return;
+    }
+    res.writeHead(200, Object.assign(headers, { 'Content-Length': stat.size }));
+    fs.createReadStream(m.file).pipe(res);
+  }));
+
+  // Ручная привязка номера (или скрытого номера «lid:…») к клиенту.
+  // 08.10.2026: если номер введён вручную в карточке (а не выбран из уже известного
+  // «не сопоставленного» чата), он может случайно совпасть с номером другого клиента —
+  // блокируем и показываем, у кого он уже числится (тот же приём, что со срезами продаж).
+  router.post('/api/whatsapp/link', requireAuth(async (req, res) => {
+    const body = await readBody(req);
+    const client = db.find('clients', body.clientId);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    if (req.user.role === 'agent' && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Можно привязывать только к своим клиентам' });
+    let key = String(body.key || '').trim();
+    if (!key.startsWith('lid:')) key = whatsapp.phoneKey(key);
+    if (!key) return sendJson(res, 400, { error: 'Не указан номер' });
+    // Номер был отвязан — вернуть: убираем из исключений.
+    const excluded = (client.waExcluded || []).filter((k) => k !== key);
+    if (excluded.length !== (client.waExcluded || []).length) {
+      db.update('clients', client.id, { waExcluded: excluded });
+      const fresh = db.find('clients', client.id);
+      if (whatsapp.phoneKeysFromString(fresh.phone).includes(key) || (fresh.extraContacts || []).some((x) => whatsapp.phoneKeysFromString(x.phone).includes(key))) {
+        return sendJson(res, 200, { client: fresh });
+      }
+    }
+    const list = (client.waPhones || []).slice();
+    if (!list.includes(key)) {
+      const owner = whatsapp.findClientOwning(key, client.id);
+      if (owner) return sendJson(res, 409, { error: `Этот номер уже привязан к клиенту «${owner.name}» — сначала отвяжите его там.`, ownerClientId: owner.id, ownerClientName: owner.name });
+      list.push(key);
+    }
+    const updated = db.update('clients', client.id, { waPhones: list });
+    sendJson(res, 200, { client: updated });
+  }));
+
+  router.post('/api/whatsapp/unlink', requireAuth(async (req, res) => {
+    const body = await readBody(req);
+    const client = db.find('clients', body.clientId);
+    if (!client) return sendJson(res, 404, { error: 'Клиент не найден' });
+    if (req.user.role === 'agent' && client.ownerId !== req.user.id) return sendJson(res, 403, { error: 'Недостаточно прав' });
+    const key = String(body.key || '');
+    if ((client.waPhones || []).includes(key)) {
+      return sendJson(res, 200, { client: db.update('clients', client.id, { waPhones: (client.waPhones || []).filter((k) => k !== key) }) });
+    }
+    // 15.10.2026: номер из телефона/доп. контакта карточки отвязывает только
+    // админ/супервайзер — номер попадает в исключения (waExcluded), переписка уходит
+    // в «Не сопоставленные». Сам телефон в карточке не меняется.
+    if (!isStaff(req.user)) return sendJson(res, 403, { error: 'Отвязать этот номер может только администратор или супервайзер' });
+    const excluded = (client.waExcluded || []).slice();
+    if (!excluded.includes(key)) excluded.push(key);
+    const updated = db.update('clients', client.id, { waExcluded: excluded, waChatAgentId: client.waChatAgentId || null });
+    sendJson(res, 200, { client: updated });
+  }));
+}
+
+module.exports = { createCheckinTasks, bishkekDate, recordSalesSnapshots, syncCheckinTasks, register, migrateAgentRenames, migrateDocumentsStatus, migrateLegacyTaskStages, dedupeDuplicateAgentTasks, migrateClientDefaults, migrateUserDefaults, TASK_STAGES, TASK_TAGS, PAYMENT_METHODS, CONTRACT_STATUSES, sendJson, UPLOADS_DIR };

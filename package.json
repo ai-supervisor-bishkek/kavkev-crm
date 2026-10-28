@@ -1,0 +1,13 @@
+{
+  "name": "kavkev-van-crm-demo",
+  "version": "2.1.0",
+  "description": "Kav & Kev — демо CRM вэн-продаж сэндвичей. Без внешних зависимостей.",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "UNLICENSED"
+}

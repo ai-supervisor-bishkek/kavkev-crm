@@ -1,0 +1,1148 @@
+[
+ {
+  "client_name": "Магазин «Ак-Жол»",
+  "debt_amount": 320,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Ромашка»",
+  "debt_amount": 1298,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №35",
+  "debt_amount": 1904,
+  "payment_date": "2026-10-08",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет колледжа «Удача»",
+  "debt_amount": 1190,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Ырыс» №15",
+  "debt_amount": 2188,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Колос» Учебный",
+  "debt_amount": 398,
+  "payment_date": "2026-10-01",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Престиж» №3",
+  "debt_amount": 864,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Айдана»",
+  "debt_amount": 506,
+  "payment_date": "2026-10-15",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Айдана»",
+  "debt_amount": 2740,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Кристалл»",
+  "debt_amount": 510,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Удача»",
+  "debt_amount": 1166,
+  "payment_date": "2026-10-01",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Айдана»",
+  "debt_amount": 523,
+  "payment_date": "2026-10-01",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Нур» Пробная",
+  "debt_amount": 187,
+  "payment_date": "2026-10-01",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Олимп» Макетная",
+  "debt_amount": 272,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет колледжа «Престиж»",
+  "debt_amount": 2062,
+  "payment_date": "2026-10-16",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Нур»",
+  "debt_amount": 291,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Ынтымак»",
+  "debt_amount": 765,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Нур»",
+  "debt_amount": 447,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Самал» №23",
+  "debt_amount": 722,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №86",
+  "debt_amount": 568,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Бакыт» Шаблонная",
+  "debt_amount": 486,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №82",
+  "debt_amount": 1175,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Береке» №5",
+  "debt_amount": 594,
+  "payment_date": "2026-10-02",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Ырыс»",
+  "debt_amount": 788,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Жибек» №14",
+  "debt_amount": 559,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Автомойка «Байтерек» Макетная",
+  "debt_amount": 518,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Достук»",
+  "debt_amount": 293,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Кут» №33",
+  "debt_amount": 1101,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Сапат» Показательный",
+  "debt_amount": 391,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Столовая «Семья»",
+  "debt_amount": 494,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Ала-Тоо» Образцовая",
+  "debt_amount": 460,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Сапат» Условный",
+  "debt_amount": 1862,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Мечта» №20",
+  "debt_amount": 601,
+  "payment_date": "2026-10-02",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Лето»",
+  "debt_amount": 570,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Тулпар»",
+  "debt_amount": 440,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Ынтымак»",
+  "debt_amount": 188,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Престиж» Демо",
+  "debt_amount": 1079,
+  "payment_date": "2026-10-16",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Достук» Макетная",
+  "debt_amount": 153,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №47",
+  "debt_amount": 1306,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Алтын» Пробная",
+  "debt_amount": 479,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет университета «Береке»",
+  "debt_amount": 960,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Достук» Условный",
+  "debt_amount": 1387,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Дружба»",
+  "debt_amount": 276,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Меридиан»",
+  "debt_amount": 279,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Радуга» Условный",
+  "debt_amount": 194,
+  "payment_date": "2026-10-03",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Олимп» Образцовая",
+  "debt_amount": 330,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Престиж» №13",
+  "debt_amount": 1152,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Супермаркет «Айдана» Показательный",
+  "debt_amount": 2366,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Столовая «Бакыт»",
+  "debt_amount": 529,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Каприз» Демо",
+  "debt_amount": 376,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Уют»",
+  "debt_amount": 881,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Семья» Тестовая",
+  "debt_amount": 1344,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Восток» Тестовая",
+  "debt_amount": 504,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Меридиан» Шаблонная",
+  "debt_amount": 466,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Бакыт» №27",
+  "debt_amount": 845,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Весна» Показательный",
+  "debt_amount": 1628,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Мечта» Шаблонная",
+  "debt_amount": 594,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Уют»",
+  "debt_amount": 218,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Семья»",
+  "debt_amount": 550,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Достук»",
+  "debt_amount": 1346,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №85",
+  "debt_amount": 1069,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №96",
+  "debt_amount": 519,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Уют» №34",
+  "debt_amount": 730,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №50",
+  "debt_amount": 1380,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Супермаркет «Престиж»",
+  "debt_amount": 1291,
+  "payment_date": "2026-10-03",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Фитнес-клуб «Жибек»",
+  "debt_amount": 287,
+  "payment_date": "2026-10-03",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Ак-Жол»",
+  "debt_amount": 382,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Восток»",
+  "debt_amount": 936,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Айдана» Показательный",
+  "debt_amount": 579,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Кут»",
+  "debt_amount": 333,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Престиж» Примерный",
+  "debt_amount": 879,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Байтерек»",
+  "debt_amount": 207,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Дружба»",
+  "debt_amount": 1168,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №43",
+  "debt_amount": 1124,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Шамал» Показательный",
+  "debt_amount": 161,
+  "payment_date": "2026-10-05",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №32",
+  "debt_amount": 1963,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Олимп» Макетная",
+  "debt_amount": 573,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Мээрим» Примерный",
+  "debt_amount": 335,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Сезон» Макетная",
+  "debt_amount": 267,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Сапат»",
+  "debt_amount": 546,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Айдана» №12",
+  "debt_amount": 1151,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Алтын» Учебный",
+  "debt_amount": 907,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Ала-Тоо» Учебный",
+  "debt_amount": 472,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №55",
+  "debt_amount": 1139,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Колос»",
+  "debt_amount": 612,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Весна» Образцовая",
+  "debt_amount": 2379,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет университета «Олимп» Условный",
+  "debt_amount": 1694,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет университета «Каприз»",
+  "debt_amount": 2101,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Мечта» Условный",
+  "debt_amount": 309,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Уют» Учебный",
+  "debt_amount": 761,
+  "payment_date": "2026-10-05",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Лето» Образцовая",
+  "debt_amount": 175,
+  "payment_date": "2026-10-05",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Сезон» Пробная",
+  "debt_amount": 1036,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Сезон»",
+  "debt_amount": 356,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Нур» Пробная",
+  "debt_amount": 2392,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Гранат» Шаблонная",
+  "debt_amount": 400,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет университета «Престиж»",
+  "debt_amount": 3978,
+  "payment_date": "2026-10-13",
+  "is_overdue": true
+ },
+ {
+  "client_name": "Минимаркет «Бакыт» Учебный",
+  "debt_amount": 496,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Береке»",
+  "debt_amount": 412,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Дружба» Демо",
+  "debt_amount": 270,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Шамал» Примерный",
+  "debt_amount": 444,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №54",
+  "debt_amount": 1533,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Каприз»",
+  "debt_amount": 159,
+  "payment_date": "2026-10-06",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Дружба»",
+  "debt_amount": 582,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Береке»",
+  "debt_amount": 861,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Ромашка» Условный",
+  "debt_amount": 353,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Ырыс» Пробная",
+  "debt_amount": 274,
+  "payment_date": "2026-10-06",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Семья» №37",
+  "debt_amount": 952,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Нур» Образцовая",
+  "debt_amount": 434,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Нур» Тестовая",
+  "debt_amount": 445,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Береке» Пробная",
+  "debt_amount": 384,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Самал» Демо",
+  "debt_amount": 349,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Алтын» Примерный",
+  "debt_amount": 209,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Сапат»",
+  "debt_amount": 1246,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Арзан»",
+  "debt_amount": 848,
+  "payment_date": "2026-10-06",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Кут» Показательный",
+  "debt_amount": 255,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Ак-Жол» Показательный",
+  "debt_amount": 522,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Тулпар»",
+  "debt_amount": 4020,
+  "payment_date": "2026-10-14",
+  "is_overdue": true
+ },
+ {
+  "client_name": "БЦ «Мээрим»",
+  "debt_amount": 1366,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Нур» Тестовая",
+  "debt_amount": 1041,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет университета «Удача»",
+  "debt_amount": 1787,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Лето»",
+  "debt_amount": 799,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Супермаркет «Семья» Условный",
+  "debt_amount": 1299,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Тулпар» Макетная",
+  "debt_amount": 421,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Асман»",
+  "debt_amount": 337,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №96",
+  "debt_amount": 1234,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Звезда»",
+  "debt_amount": 540,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Удача»",
+  "debt_amount": 403,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Алтын» №5",
+  "debt_amount": 813,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №15",
+  "debt_amount": 2078,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Алтын»",
+  "debt_amount": 856,
+  "payment_date": "2026-10-07",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Семья»",
+  "debt_amount": 265,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Тулпар»",
+  "debt_amount": 254,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Нур»",
+  "debt_amount": 1146,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Фитнес-клуб «Олимп» Показательный",
+  "debt_amount": 739,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Каприз» Демо",
+  "debt_amount": 257,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Жибек»",
+  "debt_amount": 504,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Восток» Условный",
+  "debt_amount": 451,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет школы №69",
+  "debt_amount": 1506,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Байтерек»",
+  "debt_amount": 1481,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Ынтымак»",
+  "debt_amount": 542,
+  "payment_date": "2026-10-08",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Восток»",
+  "debt_amount": 297,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №63",
+  "debt_amount": 407,
+  "payment_date": "2026-10-08",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Фитнес-клуб «Ырыс»",
+  "debt_amount": 365,
+  "payment_date": "2026-10-08",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Радуга»",
+  "debt_amount": 119,
+  "payment_date": "2026-10-08",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Уют» №18",
+  "debt_amount": 654,
+  "payment_date": "2026-10-22",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Самал» Условный",
+  "debt_amount": 1166,
+  "payment_date": "2026-10-09",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Мечта» Макетная",
+  "debt_amount": 154,
+  "payment_date": "2026-10-09",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Мечта» №7",
+  "debt_amount": 1071,
+  "payment_date": "2026-10-09",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Ромашка» Тестовая",
+  "debt_amount": 137,
+  "payment_date": "2026-10-09",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Байтерек»",
+  "debt_amount": 171,
+  "payment_date": "2026-10-09",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Семья»",
+  "debt_amount": 435,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Супермаркет «Лето» Примерный",
+  "debt_amount": 720,
+  "payment_date": "2026-10-12",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Айдана» Пробная",
+  "debt_amount": 337,
+  "payment_date": "2026-10-12",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Кут» №22",
+  "debt_amount": 1308,
+  "payment_date": "2026-10-13",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет колледжа «Тулпар»",
+  "debt_amount": 1004,
+  "payment_date": "2026-10-13",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Лето» Учебный",
+  "debt_amount": 105,
+  "payment_date": "2026-10-13",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Весна» Демо",
+  "debt_amount": 689,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Уют»",
+  "debt_amount": 103,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кафе «Асман»",
+  "debt_amount": 271,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №60",
+  "debt_amount": 975,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Асман»",
+  "debt_amount": 259,
+  "payment_date": "2026-10-14",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Шамал»",
+  "debt_amount": 365,
+  "payment_date": "2026-10-15",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Весна» Тестовая",
+  "debt_amount": 203,
+  "payment_date": "2026-10-15",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Меридиан»",
+  "debt_amount": 155,
+  "payment_date": "2026-10-16",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Кофейня «Олимп»",
+  "debt_amount": 379,
+  "payment_date": "2026-10-16",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Радуга»",
+  "debt_amount": 171,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Удача» №10",
+  "debt_amount": 725,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Маркет «Шамал»",
+  "debt_amount": 568,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет колледжа «Изумруд»",
+  "debt_amount": 883,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Самал» Примерный",
+  "debt_amount": 186,
+  "payment_date": "2026-10-17",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет колледжа «Достук»",
+  "debt_amount": 1142,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №46",
+  "debt_amount": 407,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Бакыт»",
+  "debt_amount": 221,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Киоск «Ак-Жол»",
+  "debt_amount": 156,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Сапат» №5",
+  "debt_amount": 388,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Столовая «Самал» Показательный",
+  "debt_amount": 483,
+  "payment_date": "2026-10-19",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Продукты «Бакыт»",
+  "debt_amount": 133,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Гранат» Учебный",
+  "debt_amount": 107,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Магазин «Асман»",
+  "debt_amount": 129,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Изумруд» №20",
+  "debt_amount": 265,
+  "payment_date": "2026-10-20",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Мээрим» №24",
+  "debt_amount": 664,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет больницы №48",
+  "debt_amount": 460,
+  "payment_date": "2026-10-21",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Тулпар»",
+  "debt_amount": 288,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Сезон» №19",
+  "debt_amount": 458,
+  "payment_date": "2026-10-23",
+  "is_overdue": false
+ },
+ {
+  "client_name": "АЗС «Мээрим» №39",
+  "debt_amount": 516,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Буфет ЦСМ №1",
+  "debt_amount": 384,
+  "payment_date": "2026-10-24",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Столовая «Ак-Жол»",
+  "debt_amount": 428,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Павильон «Байтерек» Макетная",
+  "debt_amount": 124,
+  "payment_date": "2026-10-26",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Офис-буфет «Гранат»",
+  "debt_amount": 422,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "Минимаркет «Береке» Пробная",
+  "debt_amount": 127,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ },
+ {
+  "client_name": "БЦ «Достук» Пробная",
+  "debt_amount": 713,
+  "payment_date": "2026-10-27",
+  "is_overdue": false
+ }
+]

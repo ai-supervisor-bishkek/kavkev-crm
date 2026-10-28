@@ -1,0 +1,190 @@
+// Простое файловое хранилище на JSON. Без внешних зависимостей.
+// Подходит для небольшой команды (десятки пользователей, тысячи записей).
+// Все операции синхронные — для CRM с несколькими одновременными пользователями этого достаточно.
+
+const fs = require('fs');
+const path = require('path');
+
+// Фаза 42 (01.10.2026): база — на постоянном диске Render (/var/data), см. src/paths.js.
+const { PERSIST_DIR: DATA_DIR, DB_FILE } = require('./paths');
+
+function emptyState() {
+  return {
+    counters: { users: 0, clients: 0, tasks: 0, supervisorMeetings: 0 },
+    users: [],
+    clients: [],
+    tasks: [],
+    supervisorMeetings: [],
+    sessions: {},
+    // Мелкие одиночные настройки (не коллекция записей) — например, дата
+    // "снято на" для остатков склада после загрузки через панель (Фаза 19).
+    settings: {}
+  };
+}
+
+let state = null;
+
+function ensureLoaded() {
+  if (state) return;
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DB_FILE)) {
+    state = emptyState();
+    persist();
+    return;
+  }
+  try {
+    const raw = fs.readFileSync(DB_FILE, 'utf8');
+    state = Object.assign(emptyState(), JSON.parse(raw));
+  } catch (err) {
+    console.error('Не удалось прочитать data/db.json, создаю новую базу:', err.message);
+    // Бэкапим повреждённый файл, чтобы не потерять данные безвозвратно
+    try { fs.copyFileSync(DB_FILE, DB_FILE + '.broken-' + Date.now()); } catch (e) {}
+    state = emptyState();
+    persist();
+  }
+}
+
+// Пакетный режим — используется массовым импортом (см. import.js), где подряд идут
+// сотни insert/update по контрагентам. Без него каждый вызов сериализует и пишет на
+// диск ВЕСЬ файл базы (сейчас уже несколько МБ — ассортимент/акции/поставторы и т.д.),
+// то есть импорт был бы O(n²) от размера базы. beginBatch()/endBatch() откладывают
+// физическую запись до одного финального persist() — семантика insert/update/remove
+// (что видно через db.all/db.find сразу после вызова) не меняется, меняется только
+// то, когда именно это попадает на диск.
+let batching = false;
+let pendingWrite = false;
+
+function persistNow() {
+  const tmp = DB_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, DB_FILE); // атомарная замена файла
+  pendingWrite = false;
+}
+
+function persist() {
+  if (batching) { pendingWrite = true; return; }
+  persistNow();
+}
+
+function beginBatch() {
+  ensureLoaded();
+  batching = true;
+}
+
+function endBatch() {
+  batching = false;
+  if (pendingWrite) persistNow();
+}
+
+function nextId(collection) {
+  ensureLoaded();
+  state.counters[collection] = (state.counters[collection] || 0) + 1;
+  return state.counters[collection];
+}
+
+// ---- Универсальные CRUD-хелперы ----
+
+function all(collection) {
+  ensureLoaded();
+  return state[collection];
+}
+
+function find(collection, id) {
+  ensureLoaded();
+  return state[collection].find((r) => r.id === Number(id));
+}
+
+function insert(collection, record) {
+  ensureLoaded();
+  const row = Object.assign({ id: nextId(collection) }, record);
+  state[collection].push(row);
+  persist();
+  return row;
+}
+
+function update(collection, id, patch) {
+  ensureLoaded();
+  const row = find(collection, id);
+  if (!row) return null;
+  Object.assign(row, patch);
+  persist();
+  return row;
+}
+
+function remove(collection, id) {
+  ensureLoaded();
+  const idx = state[collection].findIndex((r) => r.id === Number(id));
+  if (idx === -1) return false;
+  state[collection].splice(idx, 1);
+  persist();
+  return true;
+}
+
+// ---- Мелкие одиночные настройки (settings) ----
+
+function getSetting(key, fallback) {
+  ensureLoaded();
+  return Object.prototype.hasOwnProperty.call(state.settings, key) ? state.settings[key] : fallback;
+}
+
+function setSetting(key, value) {
+  ensureLoaded();
+  state.settings[key] = value;
+  persist();
+}
+
+// ---- Сессии (хранятся в базе, чтобы переживать перезапуск сервера) ----
+
+function createSession(token, userId, expiresAt) {
+  ensureLoaded();
+  state.sessions[token] = { userId, expiresAt };
+  persist();
+}
+
+function getSession(token) {
+  ensureLoaded();
+  const s = state.sessions[token];
+  if (!s) return null;
+  if (Date.now() > s.expiresAt) {
+    delete state.sessions[token];
+    persist();
+    return null;
+  }
+  return s;
+}
+
+function deleteSession(token) {
+  ensureLoaded();
+  if (state.sessions[token]) {
+    delete state.sessions[token];
+    persist();
+  }
+}
+
+// 09.10.2026: после смены пароля — выйти из всех остальных сессий этого сотрудника.
+function deleteSessionsOfUser(userId, exceptToken) {
+  ensureLoaded();
+  let n = 0;
+  Object.keys(state.sessions).forEach((t) => {
+    if (t !== exceptToken && state.sessions[t].userId === Number(userId)) { delete state.sessions[t]; n++; }
+  });
+  if (n) persist();
+  return n;
+}
+
+module.exports = {
+  ensureLoaded,
+  deleteSessionsOfUser,
+  all,
+  find,
+  insert,
+  update,
+  remove,
+  createSession,
+  getSession,
+  deleteSession,
+  beginBatch,
+  endBatch,
+  getSetting,
+  setSetting
+};

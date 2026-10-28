@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kav &amp; Kev — вэн-продажи (демо)</title>
+<script src="/demo-clock.js"></script>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<div id="login-screen" class="screen">
+  <div class="login-box">
+    <div class="kk-logo-wrap"><img src="/logo.png" alt="" class="kk-logo" onerror="this.remove()"><h1>Kav &amp; Kev</h1></div><p class="muted" style="margin:-6px 0 6px">CRM вэн-продаж</p>
+    <p class="muted">Вход в систему</p>
+    <form id="login-form">
+      <label>Email</label>
+      <input type="email" id="login-email" required autocomplete="username">
+      <label>Пароль</label>
+      <input type="password" id="login-password" required autocomplete="current-password">
+      <button type="submit">Войти</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<div id="app-screen" class="screen" style="display:none">
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="brand"><img src="/logo.png" alt="" class="kk-logo-sm" onerror="this.remove()">Kav &amp; Kev <span class="muted" style="font-weight:400;font-size:13px">· вэн-продажи</span></div>
+      <div class="user-box">
+        <span id="today-date" class="muted" style="margin-right:14px;font-size:13px"></span>
+        <span id="geo-indicator" class="muted" style="display:none;margin-right:10px;font-size:12px" title="Пока открыт сайт CRM, в рабочее время местоположение отправляется супервайзеру раз в 5 минут">📍 геолокация</span>
+        <span id="user-name"></span>
+        <button id="my-password-btn" title="Сменить свой пароль">🔑 Пароль</button>
+        <button id="logout-btn">Выйти</button>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button data-view="dashboard" class="tab active">Дашборд</button>
+      <button data-view="clients" class="tab">Клиенты<span class="nav-badge" id="badge-clients"></span></button>
+      <button data-view="brands" class="tab">По линейкам</button>
+      <button data-view="van" class="tab">🚚 Вэн</button>
+      <button data-view="vanorders" class="tab">Заявки</button>
+      <button data-view="vanreturns" class="tab">Возвраты</button>
+      <button data-view="vancash" class="tab">Инкассация</button>
+      <button data-view="tasks" class="tab">Задачи<span class="nav-badge" id="badge-tasks"></span></button>
+      <button data-view="calendar" class="tab">Календарь</button>
+      <button data-view="myday" class="tab" id="myday-tab" style="display:none">Мой день</button>
+      <button data-view="reports" class="tab" id="reports-tab" style="display:none">Отчёты</button>
+      <button data-view="dynamics" class="tab" id="dynamics-tab" style="display:none">Динамика</button>
+      <button data-view="abc" class="tab" id="abc-tab" style="display:none!important">ABC</button>
+      <button data-view="activity" class="tab" id="activity-tab" style="display:none">Активность</button>
+      <button data-view="whatsapp" class="tab">WhatsApp</button>
+      <button data-view="tracker" class="tab" id="tracker-tab" style="display:none">Трекер</button>
+      <button data-view="team" class="tab" id="team-tab" style="display:none">Команда</button>
+    </nav>
+  </header>
+
+  <main id="content"></main>
+</div>
+
+<div id="modal-root"></div>
+
+<script src="/app.js"></script>
+<script src="/van.js"></script>
+<script src="/demo.js"></script>
+</body>
+</html>
