@@ -32,7 +32,7 @@
   // ---------- Плашка ----------
   var bar = document.createElement('div');
   bar.className = 'demo-bar';
-  bar.innerHTML = '<b>ДЕМО-ВЕРСИЯ</b> · данные вымышленные · контакты скрыты · изменения не сохраняются (кроме заявок — до перезапуска)';
+  bar.innerHTML = '<b>ДЕМО-ВЕРСИЯ</b> · данные вымышленные · изменения не сохраняются (кроме заявок — до перезапуска)';
   document.body.insertBefore(bar, document.body.firstChild);
 
   // SVG-фильтр размытия (для подписей на графиках)
@@ -45,6 +45,7 @@
   // ---------- Размытие ----------
   // Kav&Kev: все данные вымышленные — суммы показываем, размываем только контакты.
   var BLUR_MONEY = false;
+  var BLUR_ANY = false;
   var NEVER = /(?!)/g;
   var NUM = '\\d[\\d\\s\\u00a0\\u202f]*(?:[.,]\\d+)?';
   var MONEY = new RegExp('[-−+]?' + NUM + '\\s*(?:(?:тыс\\.?|млн\\.?|т\\.)\\s*)?сом|[-−+]?' + NUM + '\\s*(?:тыс\\.|млн)', 'gi');
@@ -168,6 +169,7 @@
   }
 
   function processAll(root) {
+    if (!BLUR_ANY) return; // Kav&Kev: размытие отключено — все данные вымышленные
     if (!root || root.nodeType !== 1) return;
     processTables(root);
     processInputs(root);
